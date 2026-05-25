@@ -1,6 +1,6 @@
-# DevSecOps K8s Agent — Claude Managed Agents + MCP + Slack
+# DevSecOps K8s Agent — Claude/Mistral + MCP + Telegram
 
-Agent autonome de sécurité Kubernetes propulsé par Claude (Anthropic), déployé sur AWS Academy via la beta **Managed Agents**. Il scanne automatiquement les clusters EKS, détecte les vulnérabilités CVE et envoie des alertes sur Slack.
+Agent autonome de sécurité Kubernetes propulsé par **Mistral AI** (prioritaire) ou **Claude Anthropic**, déployé sur AWS Academy. Il scanne automatiquement les clusters EKS, détecte les vulnérabilités CVE et envoie des alertes sur **Telegram**.
 
 ---
 
@@ -11,14 +11,12 @@ Agent autonome de sécurité Kubernetes propulsé par Claude (Anthropic), déplo
 - [Stack technique](#stack-technique)
 - [Structure du projet](#structure-du-projet)
 - [MCP Servers](#mcp-servers)
-  - [mcp-kubectl](#mcp-kubectl)
-  - [mcp-trivy](#mcp-trivy)
-  - [mcp-slack](#mcp-slack)
 - [Orchestrateur principal](#orchestrateur-principal)
+- [Scanner local (recommandé)](#scanner-local-recommandé)
 - [Pipeline CI/CD GitHub Actions](#pipeline-cicd-github-actions)
 - [Configuration des secrets](#configuration-des-secrets)
 - [Démarrage rapide](#démarrage-rapide)
-- [Exemple de rapport généré](#exemple-de-rapport-généré)
+- [Exemple de rapport Telegram](#exemple-de-rapport-telegram)
 - [Spécificités AWS Academy](#spécificités-aws-academy)
 
 ---
@@ -28,13 +26,13 @@ Agent autonome de sécurité Kubernetes propulsé par Claude (Anthropic), déplo
 Ce projet met en œuvre un **agent IA autonome** capable d'auditer la sécurité d'un cluster Kubernetes sans intervention humaine. À partir d'un simple namespace K8s, l'agent :
 
 1. Inventorie toutes les ressources et images Docker déployées
-2. Lance des scans de vulnérabilités CVE sur chaque image
+2. Lance des scans de vulnérabilités CVE sur chaque image avec Trivy
 3. Détecte les misconfigurations de sécurité dans les manifests K8s
-4. Envoie des alertes Slack immédiates pour chaque CVE critique
-5. Génère un rapport de sécurité noté sur 100 avec un plan de remédiation
-6. Publie le rapport complet sur Slack
+4. Envoie des **alertes Telegram immédiates** pour chaque CVE CRITICAL
+5. Génère un **rapport de sécurité sous forme de tableau** noté sur 100
+6. Publie le rapport complet sur Telegram
 
-Le tout est orchestré via l'API **Claude Managed Agents** (beta) d'Anthropic, qui gère le cycle de vie de l'agent, les sessions, et la communication avec les outils externes via le protocole **MCP** (Model Context Protocol).
+Le LLM utilisé est **Mistral AI** (`mistral-large-latest`) si `MISTRAL_API_KEY` est défini, sinon **Claude Sonnet 4.6** (Anthropic). Le mode opérationnel principal est `scan-local.ts` (Messages API + outils locaux), qui ne nécessite pas de serveurs MCP exposés publiquement.
 
 ---
 
@@ -42,66 +40,60 @@ Le tout est orchestré via l'API **Claude Managed Agents** (beta) d'Anthropic, q
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                     main.ts                             │
-│              (Orchestrateur TypeScript)                 │
-│   - Crée un environnement cloud managé                  │
-│   - Ouvre une session agent                             │
-│   - Envoie la tâche d'audit                             │
-│   - Stream les événements en temps réel                 │
-│   - Sauvegarde le rapport local                         │
-└───────────────────────┬─────────────────────────────────┘
-                        │ API Anthropic (beta managed-agents-2026-04-01)
-                        ▼
-┌─────────────────────────────────────────────────────────┐
-│            Claude Managed Agent                         │
-│         (claude-sonnet-4-6 — AWS)                       │
+│                   scan-local.ts                         │
+│         (Mode opérationnel recommandé)                  │
 │                                                         │
-│  Raisonnement autonome :                                │
-│  1. Planifie l'audit                                    │
-│  2. Sélectionne les outils MCP                          │
-│  3. Interprète les résultats                            │
-│  4. Prend des décisions (alerter ou non)                │
-│  5. Génère le rapport final                             │
-└──────┬──────────────────┬──────────────────┬────────────┘
-       │ MCP              │ MCP              │ MCP
-       ▼                  ▼                  ▼
-┌────────────┐   ┌───────────────┐   ┌─────────────┐
-│ mcp-kubectl│   │  mcp-trivy    │   │  mcp-slack  │
-│            │   │               │   │             │
-│ kubectl_get│   │trivy_scan_    │   │slack_alert_ │
-│ kubectl_   │   │  image        │   │  critical   │
-│  describe  │   │trivy_scan_    │   │slack_send_  │
-│ kubectl_   │   │  manifest     │   │  report     │
-│  dry_run   │   │trivy_scan_fs  │   │             │
-│ kubectl_   │   │               │   │             │
-│  get_images│   │               │   │             │
-└─────┬──────┘   └──────┬────────┘   └──────┬──────┘
-      │                 │                   │
-      ▼                 ▼                   ▼
-┌──────────┐    ┌──────────────┐    ┌──────────────┐
-│  Cluster │    │  Images      │    │  Slack       │
-│  AWS EKS │    │  Docker Hub  │    │  #alerts     │
-│  kubectl │    │  ECR, etc.   │    │  (webhook)   │
-└──────────┘    └──────────────┘    └──────────────┘
+│   Priorité LLM : MISTRAL_API_KEY → ANTHROPIC_API_KEY   │
+│   - Loop agent avec tool_use (Messages API)             │
+│   - Outils exécutés localement (child_process)          │
+│   - trivy.log écrit en temps réel                       │
+│   - Résultats trivy compactés (évite rate limit)        │
+└──────────────┬──────────────────────────────────────────┘
+               │ tool_use / tool_result
+               ▼
+┌──────────────────────────────────────────────────────────┐
+│              Outils intégrés (runTool)                   │
+├──────────────┬───────────────┬───────────────────────────┤
+│  kubectl     │    trivy      │      Telegram             │
+│              │               │                           │
+│ kubectl_get  │ trivy_scan_   │ telegram_alert_critical   │
+│ kubectl_get_ │   image       │ telegram_send_report      │
+│   images     │ trivy_scan_   │   (tableau par image)     │
+│              │   manifest    │                           │
+└──────┬───────┴───────┬───────┴──────────────┬────────────┘
+       ▼               ▼                      ▼
+┌──────────┐   ┌──────────────┐      ┌──────────────────┐
+│  Cluster │   │  Images ECR  │      │  Telegram Bot    │
+│  AWS EKS │   │  (AWS ECR)   │      │  @alert_k8s_     │
+│          │   │  trivy.log   │      │  grassa_bot      │
+└──────────┘   └──────────────┘      └──────────────────┘
 ```
 
-### Flux d'exécution détaillé
+### Mode cloud (main.ts — expérimental)
+
+`main.ts` utilise l'API **Claude Managed Agents** (beta `managed-agents-2026-04-01`) avec des serveurs MCP (`mcp-kubectl`, `mcp-trivy`, `mcp-telegram`). Ce mode nécessite que les serveurs MCP soient exposés via une URL publique pour être accessibles depuis le cloud Anthropic.
+
+### Flux CI/CD
 
 ```
-main.ts
-  │
-  ├─► environments.create()     → Crée un sandbox cloud isolé
-  │
-  ├─► sessions.create()         → Démarre une session agent
-  │
-  ├─► sessions.events.send()    → Envoie la tâche (namespace à auditer)
-  │
-  └─► sessions.events.stream()  → Stream des événements en temps réel
-          │
-          ├─ agent.message      → Texte de raisonnement de l'agent
-          ├─ agent.tool_use     → Appel d'un outil MCP (kubectl/trivy/slack)
-          ├─ session.status_idle → Audit terminé
-          └─ session.status_error → Erreur à gérer
+GitHub Actions — devsecops-scan.yml
+   │
+   ├─ Job 1: trivy-scan (toujours exécuté)
+   │     ├─ Installe trivy, configure AWS/kubectl/ECR
+   │     ├─ Extrait toutes les images des pods
+   │     ├─ Scanne chaque image → trivy.log + trivy-results/*.json
+   │     ├─ Scanne les manifests K8s → k8s-manifests/
+   │     ├─ Écrit $GITHUB_STEP_SUMMARY (counts CRITICAL/HIGH)
+   │     ├─ Upload artifacts: trivy.log + trivy-results/ (30 jours)
+   │     └─ Fail pipeline si CVE CRITICAL trouvé
+   │
+   └─ Job 2: ai-scan (après trivy-scan, même si échec)
+         ├─ Télécharge trivy.log depuis job 1
+         ├─ npx ts-node scan-local.ts <namespace>
+         │     ├─ Mistral/Claude analyse les résultats
+         │     ├─ Alertes Telegram par CVE CRITICAL
+         │     └─ Rapport Telegram avec tableau par image
+         └─ Upload artifact: reports/security-report-*.md
 ```
 
 ---
@@ -111,13 +103,14 @@ main.ts
 | Composant | Technologie | Rôle |
 |---|---|---|
 | Langage | TypeScript / Node.js 20 | Tout le code |
-| IA | Claude Sonnet 4.6 (Managed Agents beta) | Raisonnement autonome |
-| Protocole outils | MCP (Model Context Protocol) v1.29 | Communication agent ↔ outils |
-| Scanner CVE | Trivy (Aqua Security) | Détection de vulnérabilités |
+| LLM principal | Mistral AI `mistral-large-latest` | Raisonnement autonome (priorité) |
+| LLM secondaire | Claude Sonnet 4.6 (Anthropic) | Fallback si pas de clé Mistral |
+| Protocole outils (cloud) | MCP (Model Context Protocol) v1.29 | Communication agent ↔ outils (mode cloud) |
+| Scanner CVE | Trivy v0.70+ (Aqua Security) | Détection de vulnérabilités |
 | Infra K8s | AWS EKS (Elastic Kubernetes Service) | Cluster cible |
 | Cloud | AWS Academy | Environnement de lab |
-| Notifications | Slack API (chat.postMessage) | Alertes et rapports |
-| CI/CD | GitHub Actions | Automatisation des scans |
+| Notifications | Telegram Bot API (`sendMessage`) | Alertes et rapports en temps réel |
+| CI/CD | GitHub Actions (2 jobs) | Trivy direct + Agent IA |
 | Auth AWS | Credentials temporaires (session token) | Spécificité AWS Academy |
 
 ---
@@ -129,118 +122,114 @@ managend_agents/
 │
 ├── README.md                          ← Ce fichier
 ├── CLAUDE.md                          ← Instructions pour Claude Code
-├── main.ts                            ← Orchestrateur principal
-├── tsconfig.json                      ← Config TypeScript (CommonJS)
-├── package.json                       ← Dépendances root (@anthropic-ai/sdk)
+├── Lisezmoi.md                        ← Récapitulatif déploiement complet
+├── scan-local.ts                      ← Scanner principal (Messages API + outils locaux)
+├── main.ts                            ← Orchestrateur cloud (Managed Agents beta)
+├── create-agent.ts                    ← Script création agent via REST
+├── tsconfig.json
+├── package.json                       ← @anthropic-ai/sdk, @mistralai/mistralai, MCP SDK
 │
-├── mcp-kubectl/                       ← MCP Server kubectl
+├── mcp-kubectl/                       ← MCP Server kubectl (mode cloud)
 │   ├── index.ts                       ← 4 outils : get, describe, dry_run, get_images
-│   ├── tsconfig.json                  ← Config TypeScript (ESM / NodeNext)
-│   ├── package.json
-│   └── dist/                          ← Build compilé (généré par tsc)
+│   └── dist/
 │
-├── mcp-trivy/                         ← MCP Server trivy
+├── mcp-trivy/                         ← MCP Server trivy (mode cloud)
 │   ├── index.ts                       ← 3 outils : scan_image, scan_manifest, scan_fs
-│   ├── tsconfig.json
-│   ├── package.json
 │   └── dist/
 │
-├── mcp-slack/                         ← MCP Server Slack
+├── mcp-telegram/                      ← MCP Server Telegram (mode cloud)
 │   ├── index.ts                       ← 2 outils : alert_critical, send_report
-│   ├── tsconfig.json
-│   ├── package.json
 │   └── dist/
 │
+├── eks-cluster.yaml                   ← Déploiement EKS (LabEksClusterRole)
+├── eks-nodegroup.yaml                 ← Node group EKS (LabEksNodeRole)
 ├── reports/                           ← Rapports générés (ignorés par git)
 │   └── security-report-<ns>-<ts>.md
-│
 └── .github/
     └── workflows/
-        └── devsecops-scan.yml         ← Pipeline CI/CD GitHub Actions
+        └── devsecops-scan.yml         ← Pipeline CI/CD (2 jobs)
 ```
 
 ---
 
 ## MCP Servers
 
-Les MCP Servers sont des processus Node.js indépendants qui exposent des outils à l'agent Claude via le protocole stdio MCP. Chaque serveur est déclaré à la création de l'agent et ne peut pas être ajouté dynamiquement.
+Utilisés en mode cloud (`main.ts`). En mode local (`scan-local.ts`), les outils sont exécutés directement via `child_process` sans serveur MCP intermédiaire.
 
 ### mcp-kubectl
 
 **Fichier :** `mcp-kubectl/index.ts`
 
-Expose 4 outils pour inspecter un cluster Kubernetes via `kubectl` :
-
 | Outil | Description | Paramètres |
 |---|---|---|
-| `kubectl_get` | Liste les ressources K8s (pods, deployments, services…) | `resource`, `namespace`, `flags` |
+| `kubectl_get` | Liste les ressources K8s | `resource`, `namespace`, `flags` |
 | `kubectl_describe` | Détails complets d'une ressource | `resource`, `name`, `namespace` |
 | `kubectl_dry_run` | Valide un manifest sans l'appliquer | `manifest_path` |
 | `kubectl_get_images` | Liste toutes les images des pods | `namespace` |
-
-Chaque commande a un timeout de 30 secondes. Les erreurs kubectl sont remontées comme texte (pas d'exception levée) pour que l'agent puisse interpréter le message d'erreur.
-
----
 
 ### mcp-trivy
 
 **Fichier :** `mcp-trivy/index.ts`
 
-Expose 3 outils de scan de sécurité via `trivy` (Aqua Security) :
-
 | Outil | Description | Paramètres |
 |---|---|---|
-| `trivy_scan_image` | Scanne une image Docker pour des CVEs | `image`, `severity` (défaut: CRITICAL,HIGH) |
+| `trivy_scan_image` | Scanne une image Docker pour des CVEs | `image`, `severity` |
 | `trivy_scan_manifest` | Scanne les misconfigurations d'un manifest K8s | `path` |
-| `trivy_scan_fs` | Scanne un répertoire (dépendances, secrets, IaC) | `path`, `scanners` |
+| `trivy_scan_fs` | Scanne un répertoire (dépendances, IaC) | `path`, `scanners` |
 
-**Note importante :** Trivy retourne `exit code 1` quand des vulnérabilités sont trouvées — ce comportement est normal et géré explicitement (on lit `err.stdout` pour récupérer le JSON des résultats). Timeout de 120 secondes, buffer de 10 MB pour les gros scans.
+Trivy retourne `exit code 1` quand des vulnérabilités sont trouvées — comportement normal, géré via `err.stdout`.
 
----
+### mcp-telegram
 
-### mcp-slack
-
-**Fichier :** `mcp-slack/index.ts`
-
-Expose 2 outils pour envoyer des messages sur Slack via l'API `chat.postMessage` :
+**Fichier :** `mcp-telegram/index.ts` *(remplace mcp-slack)*
 
 | Outil | Description | Paramètres |
 |---|---|---|
-| `slack_alert_critical` | Alerte formatée avec blocs Slack (emoji sévérité, CVE list, remédiation) | `namespace`, `severity`, `cve_list`, `image`, `remediation` |
-| `slack_send_report` | Envoie le rapport complet (score + contenu Markdown tronqué à 2000 chars) | `report_content`, `title`, `score` |
+| `telegram_alert_critical` | Alerte formatée HTML (emoji sévérité, liste CVE, remédiation) | `namespace`, `severity`, `cve_list`, `image`, `remediation` |
+| `telegram_send_report` | Rapport complet avec tableau par image | `title`, `score`, `remediation` |
 
-Le token Slack (`SLACK_BOT_TOKEN`) et le canal par défaut (`SLACK_CHANNEL_ID`) sont injectés via variables d'environnement — jamais écrits en dur.
+Le token bot (`TELEGRAM_BOT_TOKEN`) et le chat ID (`TELEGRAM_CHAT_ID`) sont injectés via variables d'environnement.
 
 ---
 
 ## Orchestrateur principal
 
-**Fichier :** `main.ts`
-
-Point d'entrée du programme. Prend un namespace K8s en argument (défaut : `default`).
+**Fichier :** `main.ts` — Mode cloud via API Managed Agents (expérimental)
 
 ```bash
 npx ts-node main.ts production
-npx ts-node main.ts staging
 ```
 
-### Ce qu'il fait
+Crée un environnement cloud managé → ouvre une session agent → envoie la tâche → stream les événements SSE. Nécessite que les serveurs MCP soient accessibles via URL publique.
 
-1. **Crée un environnement cloud managé** avec networking unrestricted (nécessaire pour que trivy puisse télécharger les bases de données CVE et que Slack soit joignable)
-2. **Ouvre une session agent** liée à cet environnement
-3. **Envoie la tâche** : instructions précises en 7 étapes pour l'audit complet
-4. **Stream les événements** : affiche le raisonnement de l'agent en temps réel, log chaque appel d'outil, compte les alertes critiques
-5. **Sauvegarde le rapport** localement dans `reports/security-report-<namespace>-<timestamp>.md`
-6. **Affiche un résumé** : chemin du rapport, outils utilisés, nombre d'alertes critiques
+---
 
-### Variables d'environnement requises
+## Scanner local (recommandé)
+
+**Fichier :** `scan-local.ts` — Mode opérationnel principal
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-...      # Clé API Anthropic
-AGENT_ID=agent_...                 # ID de l'agent créé avec `ant beta:agents create`
-SLACK_BOT_TOKEN=xoxb-...          # Token bot Slack
-SLACK_CHANNEL_ID=C0XXXXXXX        # ID du canal Slack
+# Avec Mistral (prioritaire)
+MISTRAL_API_KEY="..." \
+TELEGRAM_BOT_TOKEN="..." \
+TELEGRAM_CHAT_ID="..." \
+npx ts-node scan-local.ts kube-system
+
+# Avec Claude Anthropic (fallback)
+ANTHROPIC_API_KEY="sk-ant-..." \
+TELEGRAM_BOT_TOKEN="..." \
+TELEGRAM_CHAT_ID="..." \
+npx ts-node scan-local.ts kube-system
 ```
+
+### Points clés
+
+- **Sélection LLM automatique** : si `MISTRAL_API_KEY` est défini, Mistral est utilisé ; sinon Claude.
+- **Rate limit Mistral** : retry automatique jusqu'à 5 fois avec 65s d'attente (fenêtre ~1 req/min free tier).
+- **trivy.log** : initialisé à chaque scan, enrichi par chaque appel `trivy_scan_image` et `trivy_scan_manifest`, footer ajouté en fin. Consultable localement ou téléchargeable depuis les artifacts GitHub Actions.
+- **Compaction JSON trivy** : les résultats bruts (~100 Ko/image) sont résumés en ~2 Ko via `trivySummary()` — évite de saturer le quota tokens/min du LLM.
+- **Tableau Telegram** : le rapport final est formaté en tableau ASCII dans un bloc `<pre>` HTML par `buildScanTable()` — construit depuis les données réelles trivy, pas depuis le LLM.
+- **Cache trivy** : répertoire par processus `/tmp/trivy-cache-<pid>` pour éviter les conflits de lock en parallèle.
 
 ---
 
@@ -252,62 +241,67 @@ SLACK_CHANNEL_ID=C0XXXXXXX        # ID du canal Slack
 
 | Déclencheur | Condition |
 |---|---|
-| `push` | Modification de fichiers `k8s/**/*.yaml` ou `k8s/**/*.yml` |
+| `workflow_dispatch` | Manuel depuis GitHub Actions UI (champ `namespace` optionnel) |
+| `push` | Modification de fichiers `k8s/**/*.yaml` |
 | `pull_request` | Vers les branches `master` ou `production` |
-| `schedule` | Chaque lundi à 6h UTC (`cron: "0 6 * * 1"`) |
+| `schedule` | Chaque lundi à 6h UTC |
 
-### Stratégie matrix
+### Job 1 — `trivy-scan`
 
-Le pipeline lance **3 jobs en parallèle**, un par namespace :
-- `default`
-- `production`
-- `staging`
+Scan Trivy direct, indépendant du LLM :
 
-### Étapes du pipeline
+1. Installe trivy (script officiel Aqua Security)
+2. Configure AWS credentials + kubectl (EKS) + Docker auth ECR
+3. Extrait toutes les images via `kubectl get pods --all-namespaces`
+4. Scanne chaque image : `--format table` → `trivy.log`, `--format json` → `trivy-results/<image>.json`
+5. Dump des manifests K8s → scan misconfigurations
+6. Écrit `$GITHUB_STEP_SUMMARY` avec counts CRITICAL/HIGH
+7. Upload `trivy.log` + `trivy-results/` comme artifacts (30 jours)
+8. **Fail si CVE CRITICAL détecté** → bloque le merge
 
-```
-1. Checkout du code
-2. Setup Node.js 20 avec cache npm
-3. npm ci (dépendances root)
-4. Build des 3 MCP servers (npm ci + tsc dans chaque sous-dossier)
-5. Installation de trivy (script officiel Aqua Security)
-6. Configuration des credentials AWS Academy (avec session token)
-7. Configuration de la clé SSH labsuser.pem
-8. Configuration de kubectl (aws eks update-kubeconfig)
-9. Lancement du scan : npx ts-node main.ts <namespace>
-10. Upload du rapport en artifact GitHub (rétention 30 jours)
-11. Fail si CVE CRITICAL détecté → bloque le merge
-```
+### Job 2 — `ai-scan` (`needs: trivy-scan`)
 
-### Comportement sur CVE critique
+Analyse IA + alertes Telegram :
 
-Si le rapport contient le mot `CRITICAL`, le pipeline **échoue avec exit code 1**, bloquant tout merge vers `master` ou `production`. Cela garantit qu'aucun déploiement ne passe avec une vulnérabilité critique non traitée.
+1. Télécharge `trivy.log` depuis job 1
+2. Lance `npx ts-node scan-local.ts <namespace>` avec Mistral + Telegram
+3. L'agent parcourt kubectl → trivy → alertes Telegram → rapport tableau
+4. Upload `reports/security-report-*.md` + `trivy.log` (30 jours)
+5. `continue-on-error: true` + `timeout-minutes: 20` — un rate limit LLM ne bloque pas le pipeline
 
 ---
 
 ## Configuration des secrets
 
-Tous les secrets sont configurés comme **GitHub Actions Secrets** via `gh` CLI — jamais écrits en clair dans le code.
+Tous les secrets sont configurés comme **GitHub Actions Secrets** — jamais écrits en clair dans le code.
 
 | Secret | Statut | Source |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | ⏳ À configurer | console.anthropic.com |
-| `CLAUDE_AGENT_ID` | ⏳ À configurer | Après `ant beta:agents create` |
-| `SLACK_BOT_TOKEN` | ⏳ À configurer | api.slack.com/apps |
-| `SLACK_CHANNEL_ID` | ⏳ À configurer | Slack → canal → détails |
-| `AWS_ACCESS_KEY_ID` | ✅ Configuré | `~/.aws/credentials` (AWS Academy) |
-| `AWS_SECRET_ACCESS_KEY` | ✅ Configuré | `~/.aws/credentials` (AWS Academy) |
-| `AWS_SESSION_TOKEN` | ✅ Configuré | `~/.aws/credentials` (AWS Academy) |
-| `AWS_REGION` | ✅ `us-east-1` | `~/.aws/config` |
-| `SSH_PRIVATE_KEY` | ✅ Configuré | `~/.ssh/labsuser.pem` (clé `vockey`) |
-| `EKS_CLUSTER_NAME` | ⏳ À configurer | Après déploiement EKS |
+| `ANTHROPIC_API_KEY` | ✅ Configuré | console.anthropic.com |
+| `MISTRAL_API_KEY` | ✅ Configuré | console.mistral.ai |
+| `CLAUDE_AGENT_ID` | ✅ Configuré | Après `create-agent.ts` |
+| `TELEGRAM_BOT_TOKEN` | ✅ Configuré | @BotFather → @alert_k8s_grassa_bot |
+| `TELEGRAM_CHAT_ID` | ✅ Configuré | Chat ID personnel Telegram |
+| `AWS_ACCESS_KEY_ID` | ✅ Configuré | AWS Academy → AWS Details |
+| `AWS_SECRET_ACCESS_KEY` | ✅ Configuré | AWS Academy → AWS Details |
+| `AWS_SESSION_TOKEN` | ✅ Configuré | AWS Academy → AWS Details |
+| `AWS_REGION` | ✅ `us-east-1` | AWS Academy |
+| `EKS_CLUSTER_NAME` | ✅ `eks-devsecops` | Cluster déployé |
+| `SSH_PRIVATE_KEY` | ✅ Configuré | `~/.ssh/labsuser.pem` |
 
-### Mettre à jour un secret
+### Mettre à jour les credentials AWS (expirent toutes les 3-4h)
 
 ```bash
-gh secret set ANTHROPIC_API_KEY --repo ngrassa/managend_agents
-gh secret set SLACK_BOT_TOKEN --repo ngrassa/managend_agents
-gh secret set EKS_CLUSTER_NAME --repo ngrassa/managend_agents
+gh secret set AWS_ACCESS_KEY_ID     --repo ngrassa/managend_agents
+gh secret set AWS_SECRET_ACCESS_KEY --repo ngrassa/managend_agents
+gh secret set AWS_SESSION_TOKEN     --repo ngrassa/managend_agents
+```
+
+### Mettre à jour les secrets Telegram
+
+```bash
+gh secret set TELEGRAM_BOT_TOKEN --repo ngrassa/managend_agents
+gh secret set TELEGRAM_CHAT_ID   --repo ngrassa/managend_agents
 ```
 
 ---
@@ -317,16 +311,8 @@ gh secret set EKS_CLUSTER_NAME --repo ngrassa/managend_agents
 ### Prérequis
 
 ```bash
-# Node.js 20+
-node --version
-
-# kubectl configuré
+node --version   # 20+
 kubectl get nodes
-
-# trivy installé
-trivy --version
-
-# AWS CLI configuré (AWS Academy)
 aws sts get-caller-identity
 ```
 
@@ -335,88 +321,76 @@ aws sts get-caller-identity
 ```bash
 git clone https://github.com/ngrassa/managend_agents.git
 cd managend_agents
-
-# Dépendances root
 npm install
-
-# Dépendances et build des MCP servers
-for dir in mcp-kubectl mcp-trivy mcp-slack; do
-  cd $dir && npm install && npm run build && cd ..
-done
 ```
 
-### Créer l'agent (une seule fois)
+### Lancer un scan local
 
 ```bash
-ant beta:agents create \
-  --name "k8s-devsecops-agent" \
-  --model '{"id": "claude-sonnet-4-6"}' \
-  --system "Tu es un expert DevSecOps spécialisé AWS EKS..." \
-  --tool '{"type": "agent_toolset_20260401"}' \
-  --mcp-server '{"name": "kubectl-server", "command": "node", "args": ["./mcp-kubectl/dist/index.js"]}' \
-  --mcp-server '{"name": "trivy-server", "command": "node", "args": ["./mcp-trivy/dist/index.js"]}' \
-  --mcp-server '{"name": "slack-server", "command": "node", "args": ["./mcp-slack/dist/index.js"]}'
+export PATH="$HOME/.local/bin:$PATH"   # si trivy installé localement
 
-# Récupérer l'agent.id et le configurer
-gh secret set CLAUDE_AGENT_ID --repo ngrassa/managend_agents
+MISTRAL_API_KEY="..."           \
+TELEGRAM_BOT_TOKEN="..."        \
+TELEGRAM_CHAT_ID="..."          \
+npx ts-node scan-local.ts kube-system
 ```
 
-### Lancer un audit
+### Déclencher le pipeline CI manuellement
 
 ```bash
-# Audit du namespace default
-npx ts-node main.ts default
-
-# Audit du namespace production
-npx ts-node main.ts production
-
-# Auditer plusieurs namespaces en parallèle
-for ns in default production staging; do
-  npx ts-node main.ts $ns &
-done
-wait
+gh workflow run devsecops-scan.yml \
+  --repo ngrassa/managend_agents   \
+  --field namespace=kube-system
 ```
 
-### Configurer kubectl pour EKS
+### Build des MCP servers (mode cloud)
 
 ```bash
-aws eks update-kubeconfig \
-  --region us-east-1 \
-  --name <EKS_CLUSTER_NAME>
-
-kubectl get nodes
+npm run build:all
 ```
 
 ---
 
-## Exemple de rapport généré
+## Exemple de rapport Telegram
 
-```markdown
-## Rapport DevSecOps — Namespace: production
-## Score de sécurité : 42/100 🟠
+### Alerte CRITICAL (immédiate)
 
-### 🔴 CVEs Critiques (action immédiate requise)
-| CVE           | Image        | Package  | Fix disponible      |
-|---------------|--------------|----------|---------------------|
-| CVE-2024-1234 | node:latest  | openssl  | node:20.11-alpine   |
-| CVE-2024-5678 | nginx:1.21   | zlib     | nginx:1.25-alpine   |
+```
+🔴 Alerte DevSecOps — CRITICAL
 
-### 🟠 Misconfigurations K8s détectées
-1. `privileged: true` sur deployment api-backend → supprimer
-2. `runAsUser: 0` (root) sur 3 pods → changer pour UID 1000
-3. Secrets en clair dans les env vars → migrer vers K8s Secrets
+Namespace : kube-system
+Image     : 602401143452.dkr.ecr.us-east-1.amazonaws.com/amazon-k8s-cni:v1.20.5-eksbuild.1
 
-### ✅ Plan de remédiation
-# Mettre à jour les images vulnérables
-kubectl set image deployment/api-backend api=node:20.11-alpine -n production
+CVEs :
+• CVE-2026-33186
+• CVE-2025-68121
 
-# Patcher le contexte de sécurité (supprimer root)
-kubectl patch deployment api-backend -n production -p \
-  '{"spec":{"template":{"spec":{"securityContext":{"runAsUser":1000}}}}}'
+Remédiation :
+kubectl set image daemonset/aws-node aws-node=<latest> -n kube-system
 
-# Créer un Secret K8s pour les credentials DB
-kubectl create secret generic db-creds \
-  --from-literal=password='...' -n production
+2026-05-25T15:02:42.963Z
+```
+
+### Rapport final (avec tableau)
+
+```
+🟡 Rapport DevSecOps - Namespace kube-system
+
+Score : 65/100
+
+┌──────────────────────────────┬──────────┬──────┬──────────────────────┐
+│ Image                        │ CRITICAL │ HIGH │ CVE CRITICAL (1er)   │
+├──────────────────────────────┼──────────┼──────┼──────────────────────┤
+│ amazon-k8s-cni:v1.20.5       │        2 │   14 │ CVE-2026-33186       │
+│ aws-network-policy-agent:v1. │        2 │   11 │ CVE-2026-33186       │
+│ coredns:v1.11.4              │        0 │   19 │ -                    │
+│ kube-proxy:v1.31.14          │        0 │   26 │ -                    │
+└──────────────────────────────┴──────────┴──────┴──────────────────────┘
+
+📋 Plan :
+- Mettre à jour amazon-k8s-cni et aws-network-policy-agent
+- Patcher glibc et Go stdlib sur coredns/kube-proxy
+- Automatiser les mises à jour via Renovate ou Dependabot
 ```
 
 ---
@@ -427,39 +401,24 @@ kubectl create secret generic db-creds \
 
 Les credentials AWS Academy **expirent toutes les 3-4 heures**. Quand le pipeline échoue avec `ExpiredTokenException` :
 
-1. Aller dans AWS Academy → "AWS Details" → copier les nouveaux credentials
+1. Aller dans AWS Academy → "AWS Details" → copier les nouvelles valeurs
 2. Mettre à jour `~/.aws/credentials`
-3. Mettre à jour les secrets GitHub :
+3. Mettre à jour les secrets GitHub (voir section Configuration)
 
-```bash
-# Lire les nouvelles valeurs
-cat ~/.aws/credentials
+### Rôles IAM pré-créés
 
-# Mettre à jour les secrets
-gh secret set AWS_ACCESS_KEY_ID --repo ngrassa/managend_agents
-gh secret set AWS_SECRET_ACCESS_KEY --repo ngrassa/managend_agents
-gh secret set AWS_SESSION_TOKEN --repo ngrassa/managend_agents
-```
+AWS Academy bloque `iam:CreateRole`. Les rôles utilisés sont ceux déjà créés par le lab :
 
-### Clé SSH
-
-La clé privée `~/.ssh/labsuser.pem` (paire de clés `vockey`) est utilisée pour SSH vers les nœuds EKS si nécessaire.
-
-```bash
-# Permissions obligatoires
-chmod 400 ~/.ssh/labsuser.pem
-
-# Connexion à un nœud EKS
-ssh -i ~/.ssh/labsuser.pem ec2-user@<NODE_PUBLIC_IP>
-```
+- `LabEksClusterRole` — rôle IAM du control plane EKS
+- `LabEksNodeRole` — rôle IAM des nœuds worker
 
 ### Sécurité Git
 
 - Ne jamais committer de credentials AWS dans le repo
 - Tous les secrets passent par `${{ secrets.NOM_SECRET }}` dans les workflows
-- Révoquer immédiatement tout token GitHub exposé accidentellement
+- Révoquer immédiatement tout token GitHub ou clé API exposé accidentellement
 
 ---
 
-*Repo : https://github.com/ngrassa/managend_agents*
-*Stack : TypeScript · Claude Managed Agents (beta) · MCP · AWS EKS · Trivy · Slack · GitHub Actions*
+*Repo : https://github.com/ngrassa/managend_agents*  
+*Stack : TypeScript · Mistral AI · Claude Anthropic · MCP · AWS EKS · Trivy · Telegram · GitHub Actions*

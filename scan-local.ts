@@ -39,7 +39,7 @@ const TOOLS_ANTHROPIC = [
   { name: "trivy_scan_image",  description: "Scanne une image Docker pour des CVEs (CRITICAL,HIGH)",        input_schema: { type: "object", properties: { image: { type: "string" }, severity: { type: "string", default: "CRITICAL,HIGH" } }, required: ["image"] } },
   { name: "trivy_scan_manifest",description: "Scanne les misconfigurations d'un manifest K8s",             input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } },
   { name: "telegram_alert_critical", description: "Envoie une alerte critique de sécurité sur Telegram",   input_schema: { type: "object", properties: { namespace: { type: "string" }, severity: { type: "string" }, cve_list: { type: "array", items: { type: "string" } }, image: { type: "string" }, remediation: { type: "string" } }, required: ["namespace","severity","cve_list","image","remediation"] } },
-  { name: "telegram_send_report", description: "Envoie le rapport de sécurité complet sur Telegram",       input_schema: { type: "object", properties: { report_content: { type: "string" }, title: { type: "string" }, score: { type: "number" } }, required: ["report_content","title","score"] } },
+  { name: "telegram_send_report", description: "Envoie le rapport de sécurité complet sur Telegram avec tableau par image", input_schema: { type: "object", properties: { title: { type: "string" }, score: { type: "number" }, remediation: { type: "string", description: "Plan de remédiation court (1-5 lignes)" }, report_content: { type: "string" } }, required: ["title","score"] } },
 ] as const;
 
 const TOOLS_MISTRAL = TOOLS_ANTHROPIC.map(t => ({
@@ -117,11 +117,28 @@ async function callAnthropic(messages: Message[]): Promise<{ text: string; toolC
 
 // ── Exécuteurs d'outils ───────────────────────────────────────────────────
 
+// Résultats trivy accumulés pendant le scan — utilisés pour le tableau Telegram
+const scanStore: Map<string, { critical: number; high: number; medium: number; critCves: string[] }> = new Map();
+
 function trivySummary(target: string, json: string): string {
   try {
     const parsed = JSON.parse(json || "{}");
     const vulns  = (parsed.Results || []).flatMap((r: any) => r.Vulnerabilities || []);
-    if (vulns.length === 0) return JSON.stringify({ target, total: 0, critical: 0, high: 0, cves: [] });
+    if (vulns.length === 0) {
+      scanStore.set(target, { critical: 0, high: 0, medium: 0, critCves: [] });
+      return JSON.stringify({ target, total: 0, critical: 0, high: 0, cves: [] });
+    }
+    const critCves = vulns
+      .filter((v: any) => v.Severity === "CRITICAL")
+      .map((v: any) => v.VulnerabilityID)
+      .filter((id: string, i: number, a: string[]) => a.indexOf(id) === i) // unique
+      .slice(0, 3);
+    scanStore.set(target, {
+      critical: vulns.filter((v: any) => v.Severity === "CRITICAL").length,
+      high:     vulns.filter((v: any) => v.Severity === "HIGH").length,
+      medium:   vulns.filter((v: any) => v.Severity === "MEDIUM").length,
+      critCves,
+    });
     const cves = vulns.map((v: any) => ({
       id:       v.VulnerabilityID,
       severity: v.Severity,
@@ -140,6 +157,34 @@ function trivySummary(target: string, json: string): string {
   } catch {
     return json?.slice(0, 1500) || "{}";
   }
+}
+
+function shortImageName(target: string): string {
+  const noReg = target.replace(/^[^/]+\.dkr\.ecr\.[^/]+\.amazonaws\.com\//, "");
+  const parts = noReg.split("/");
+  const tag   = parts[parts.length - 1];
+  return tag.replace(/-eksbuild\.\d+.*$/, "").slice(0, 30);
+}
+
+function buildScanTable(): string {
+  if (scanStore.size === 0) return "";
+  const rows = Array.from(scanStore.entries()).map(([target, d]) => ({
+    name: shortImageName(target),
+    critical: d.critical,
+    high:     d.high,
+    cves:     d.critCves.length > 0 ? d.critCves[0] : "-",
+  }));
+  const W = Math.max(...rows.map(r => r.name.length), 5);
+  const sep = (l: string, m: string, r: string) =>
+    `${l}${"─".repeat(W + 2)}┼──────────┼──────┼──────────────────────${r}`;
+  const top = `┌${"─".repeat(W + 2)}┬──────────┬──────┬──────────────────────┐`;
+  const hdr = `│ ${"Image".padEnd(W)} │ CRITICAL │ HIGH │ CVE CRITICAL (1er)   │`;
+  const mid = sep("├", "┼", "┤");
+  const bot = `└${"─".repeat(W + 2)}┴──────────┴──────┴──────────────────────┘`;
+  const dataRows = rows.map(r =>
+    `│ ${r.name.padEnd(W)} │${String(r.critical).padStart(8)} │${String(r.high).padStart(4)} │ ${r.cves.padEnd(20)} │`
+  );
+  return [top, hdr, mid, ...dataRows, bot].join("\n");
 }
 
 async function runTool(name: string, args: any): Promise<string> {
@@ -206,12 +251,15 @@ async function runTool(name: string, args: any): Promise<string> {
     case "telegram_send_report": {
       const score = args.score as number;
       const emoji = score >= 70 ? "🟢" : score >= 40 ? "🟡" : "🔴";
-      const text  = [
+      const table = buildScanTable();
+      const parts: string[] = [
         `${emoji} <b>${args.title}</b>`,
         `<b>Score :</b> ${score}/100`,
-        `<pre>${(args.report_content as string).slice(0, 3500)}</pre>`,
-      ].join("\n\n");
-      return await sendTelegram(text);
+      ];
+      if (table) parts.push(`<pre>${table}</pre>`);
+      if (args.remediation) parts.push(`📋 <b>Plan :</b>\n${(args.remediation as string).slice(0, 600)}`);
+      else if (args.report_content) parts.push(`<pre>${(args.report_content as string).slice(0, 1000)}</pre>`);
+      return await sendTelegram(parts.join("\n\n"));
     }
 
     default: return `Outil inconnu : ${name}`;
@@ -312,12 +360,12 @@ async function runDevSecOpsScan(namespace: string = "default") {
   // Footer trivy.log
   appendTrivyLog(`\n${"=".repeat(60)}`);
   appendTrivyLog(`# Scan terminé : ${new Date().toISOString()}`);
-  appendTrivyLog(`# Outils utilisés : ${[...new Set(toolsUsed)].join(", ")}`);
+  appendTrivyLog(`# Outils utilisés : ${Array.from(new Set(toolsUsed)).join(", ")}`);
 
   console.log("\n" + "─".repeat(50));
   console.log(`📄 Rapport  : ${reportPath}`);
   console.log(`📋 Trivy log: ${TRIVY_LOG}`);
-  console.log(`🔧 Outils   : ${[...new Set(toolsUsed)].join(", ")}`);
+  console.log(`🔧 Outils   : ${Array.from(new Set(toolsUsed)).join(", ")}`);
   console.log("─".repeat(50));
 }
 
