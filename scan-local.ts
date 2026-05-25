@@ -117,38 +117,55 @@ async function callAnthropic(messages: Message[]): Promise<{ text: string; toolC
 
 // ── Exécuteurs d'outils ───────────────────────────────────────────────────
 
-// Résultats trivy accumulés pendant le scan — utilisés pour le tableau Telegram
-const scanStore: Map<string, { critical: number; high: number; medium: number; critCves: string[] }> = new Map();
+interface CveDetail { id: string; image: string; cvss: number; title: string; fixed: string; }
+interface ScanEntry { critical: number; high: number; medium: number; critCveDetails: CveDetail[]; }
+
+// Résultats trivy accumulés pendant le scan
+const scanStore: Map<string, ScanEntry> = new Map();
+let   currentNamespace = "default";
+
+function cvssScore(v: any): number {
+  const c = v.CVSS || {};
+  const scores = Object.values(c).map((s: any) => s.V3Score || 0) as number[];
+  return scores.length ? Math.max(...scores) : 0;
+}
+
+function shortImageName(target: string): string {
+  const noReg = target.replace(/^[^/]+\.dkr\.ecr\.[^/]+\.amazonaws\.com\//, "");
+  const parts  = noReg.split("/");
+  return parts[parts.length - 1].replace(/-eksbuild\.\d+.*$/, "");
+}
 
 function trivySummary(target: string, json: string): string {
   try {
     const parsed = JSON.parse(json || "{}");
     const vulns  = (parsed.Results || []).flatMap((r: any) => r.Vulnerabilities || []);
-    if (vulns.length === 0) {
-      scanStore.set(target, { critical: 0, high: 0, medium: 0, critCves: [] });
-      return JSON.stringify({ target, total: 0, critical: 0, high: 0, cves: [] });
-    }
-    const critCves = vulns
+    const img    = shortImageName(target);
+    const critCveDetails: CveDetail[] = vulns
       .filter((v: any) => v.Severity === "CRITICAL")
-      .map((v: any) => v.VulnerabilityID)
-      .filter((id: string, i: number, a: string[]) => a.indexOf(id) === i) // unique
-      .slice(0, 3);
+      .map((v: any) => ({
+        id:    v.VulnerabilityID,
+        image: img,
+        cvss:  cvssScore(v),
+        title: (v.Title || v.Description || "").replace(/<[^>]+>/g, "").slice(0, 90),
+        fixed: v.FixedVersion || "",
+      }))
+      // dédoublonne par CVE id + image
+      .filter((v: CveDetail, i: number, a: CveDetail[]) =>
+        a.findIndex(x => x.id === v.id && x.image === v.image) === i
+      );
     scanStore.set(target, {
-      critical: vulns.filter((v: any) => v.Severity === "CRITICAL").length,
-      high:     vulns.filter((v: any) => v.Severity === "HIGH").length,
-      medium:   vulns.filter((v: any) => v.Severity === "MEDIUM").length,
-      critCves,
+      critical:       vulns.filter((v: any) => v.Severity === "CRITICAL").length,
+      high:           vulns.filter((v: any) => v.Severity === "HIGH").length,
+      medium:         vulns.filter((v: any) => v.Severity === "MEDIUM").length,
+      critCveDetails,
     });
     const cves = vulns.map((v: any) => ({
-      id:       v.VulnerabilityID,
-      severity: v.Severity,
-      pkg:      v.PkgName,
-      title:    (v.Title || "").slice(0, 60),
-      fixed:    v.FixedVersion || "no fix",
+      id: v.VulnerabilityID, severity: v.Severity,
+      pkg: v.PkgName, title: (v.Title || "").slice(0, 60), fixed: v.FixedVersion || "no fix",
     })).slice(0, 25);
     return JSON.stringify({
-      target,
-      total:    vulns.length,
+      target, total: vulns.length,
       critical: vulns.filter((v: any) => v.Severity === "CRITICAL").length,
       high:     vulns.filter((v: any) => v.Severity === "HIGH").length,
       medium:   vulns.filter((v: any) => v.Severity === "MEDIUM").length,
@@ -159,28 +176,64 @@ function trivySummary(target: string, json: string): string {
   }
 }
 
-function shortImageName(target: string): string {
-  const noReg = target.replace(/^[^/]+\.dkr\.ecr\.[^/]+\.amazonaws\.com\//, "");
-  const parts = noReg.split("/");
-  const tag   = parts[parts.length - 1];
-  return tag.replace(/-eksbuild\.\d+.*$/, "").slice(0, 30);
-}
+function buildRichReport(score: number, remediation: string): string {
+  const SEP   = "---";
+  const sEmoji = score >= 70 ? "🟢" : score >= 40 ? "🟡" : "🔴";
 
-function buildScanTable(): string {
-  if (scanStore.size === 0) return "";
-  const rows = Array.from(scanStore.entries()).map(([target, d]) => ({
-    name:     shortImageName(target),
-    critical: d.critical,
-    high:     d.high,
-    cve:      d.critCves.length > 0 ? d.critCves[0] : "-",
-  }));
-  const W   = Math.max(...rows.map(r => r.name.length), 5);
-  const sep = `+${"-".repeat(W + 2)}+----------+------+----------------------+`;
-  const hdr = `| ${"Image".padEnd(W)} | CRITICAL | HIGH | CVE CRITICAL (1er)   |`;
-  const dataRows = rows.map(r =>
-    `| ${r.name.padEnd(W)} |${String(r.critical).padStart(8)} |${String(r.high).padStart(4)} | ${r.cve.padEnd(20)} |`
-  );
-  return [sep, hdr, sep, ...dataRows, sep].join("\n");
+  // Collecte tous les CVE CRITICAL uniques (toutes images confondues)
+  const allCrit: CveDetail[] = Array.from(scanStore.values())
+    .flatMap(e => e.critCveDetails)
+    .filter((v, i, a) => a.findIndex(x => x.id === v.id && x.image === v.image) === i)
+    .slice(0, 6); // max 6 pour rester sous 4096 chars Telegram
+
+  const lines: string[] = [
+    `🔍 <b>Audit DevSecOps — Namespace ${currentNamespace}</b>`,
+    SEP,
+    `${sEmoji} <b>Score de sécurité : ${score}/100</b>`,
+  ];
+
+  if (allCrit.length > 0) {
+    lines.push(SEP);
+    lines.push(`🚨 <b>Alertes critiques (${allCrit.length})</b>`);
+    allCrit.forEach((c, i) => {
+      const cvssStr = c.cvss > 0 ? ` (CVSS ${c.cvss.toFixed(1)})` : "";
+      lines.push(`\n${i + 1}. <b>${c.id}</b>${cvssStr} — ${c.image}`);
+      if (c.title) lines.push(`   • Risque : ${c.title}`);
+      if (c.fixed) lines.push(`   • Remédiation : mettre à jour vers <code>${c.fixed}</code>`);
+    });
+  }
+
+  // Points positifs
+  const safeImages = Array.from(scanStore.values()).filter(e => e.critical === 0);
+  lines.push(SEP);
+  lines.push("✅ <b>Points positifs</b>");
+  if (safeImages.length > 0) {
+    const names = Array.from(scanStore.entries())
+      .filter(([, e]) => e.critical === 0)
+      .map(([t]) => shortImageName(t))
+      .join(", ");
+    lines.push(`• ${safeImages.length} image(s) sans CVE CRITICAL : ${names}`);
+  }
+  lines.push("• Images maintenues et signées par AWS ECR.");
+
+  // Plan de remédiation (fourni par le LLM)
+  if (remediation) {
+    lines.push(SEP);
+    lines.push("📋 <b>Plan de remédiation</b>");
+    lines.push(remediation.slice(0, 700));
+  }
+
+  // Détails
+  lines.push(SEP);
+  lines.push("ℹ️ <b>Détails</b>");
+  const totalCrit = Array.from(scanStore.values()).reduce((s, e) => s + e.critical, 0);
+  const totalHigh = Array.from(scanStore.values()).reduce((s, e) => s + e.high, 0);
+  lines.push(`• Images scannées : ${scanStore.size}`);
+  lines.push(`• CVE CRITICAL : ${totalCrit} | HIGH : ${totalHigh}`);
+  lines.push(`• Outils : kubectl, trivy, Telegram`);
+  lines.push(`• <i>${new Date().toISOString()}</i>`);
+
+  return lines.join("\n");
 }
 
 async function runTool(name: string, args: any): Promise<string> {
@@ -245,17 +298,8 @@ async function runTool(name: string, args: any): Promise<string> {
     }
 
     case "telegram_send_report": {
-      const score = args.score as number;
-      const emoji = score >= 70 ? "🟢" : score >= 40 ? "🟡" : "🔴";
-      const table = buildScanTable();
-      const parts: string[] = [
-        `${emoji} <b>${args.title}</b>`,
-        `<b>Score :</b> ${score}/100`,
-      ];
-      if (table) parts.push(`<pre>${table}</pre>`);
-      if (args.remediation) parts.push(`📋 <b>Plan :</b>\n${(args.remediation as string).slice(0, 600)}`);
-      else if (args.report_content) parts.push(`<pre>${(args.report_content as string).slice(0, 1000)}</pre>`);
-      return await sendTelegram(parts.join("\n\n"));
+      const report = buildRichReport(args.score as number, args.remediation || args.report_content || "");
+      return await sendTelegram(report);
     }
 
     default: return `Outil inconnu : ${name}`;
@@ -276,6 +320,7 @@ async function sendTelegram(text: string): Promise<string> {
 // ── Boucle agent ──────────────────────────────────────────────────────────
 
 async function runDevSecOpsScan(namespace: string = "default") {
+  currentNamespace = namespace;
   console.log(`\n🚀 Audit DevSecOps — namespace: ${namespace} [${PROVIDER}]`);
   console.log(`⏰ ${new Date().toISOString()}\n`);
 
