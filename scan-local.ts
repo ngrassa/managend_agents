@@ -74,9 +74,9 @@ async function callMistral(messages: Message[]): Promise<{ text: string; toolCal
       }),
     });
     data = await res.json() as any;
-    if (res.status === 429 && attempt < 4) {
-      const wait = (attempt + 1) * 15000;
-      console.log(`\n  ⏳ Rate limit Mistral — retry dans ${wait / 1000}s...`);
+    if (res.status === 429 && attempt < 5) {
+      const wait = 65000; // wait 65s for Mistral rate-limit window to reset
+      console.log(`\n  ⏳ Rate limit Mistral (tentative ${attempt + 1}/5) — retry dans ${wait / 1000}s...`);
       await new Promise(r => setTimeout(r, wait));
       attempt++;
       continue;
