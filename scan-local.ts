@@ -53,17 +53,29 @@ Sois méthodique : utilise les vrais résultats des outils pour ton analyse.`;
 type Message = { role: string; content: any; tool_call_id?: string; name?: string };
 
 async function callMistral(messages: Message[]): Promise<{ text: string; toolCalls: any[] }> {
-  const res  = await fetch("https://api.mistral.ai/v1/chat/completions", {
-    method:  "POST",
-    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${MISTRAL_KEY}` },
-    body: JSON.stringify({
-      model:       "mistral-large-latest",
-      messages:    [{ role: "system", content: SYSTEM }, ...messages],
-      tools:       TOOLS_MISTRAL,
-      tool_choice: "auto",
-    }),
-  });
-  const data = await res.json() as any;
+  let attempt = 0;
+  let data: any;
+  while (true) {
+    const res = await fetch("https://api.mistral.ai/v1/chat/completions", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${MISTRAL_KEY}` },
+      body: JSON.stringify({
+        model:       "mistral-large-latest",
+        messages:    [{ role: "system", content: SYSTEM }, ...messages],
+        tools:       TOOLS_MISTRAL,
+        tool_choice: "auto",
+      }),
+    });
+    data = await res.json() as any;
+    if (res.status === 429 && attempt < 4) {
+      const wait = (attempt + 1) * 15000;
+      console.log(`\n  ⏳ Rate limit Mistral — retry dans ${wait / 1000}s...`);
+      await new Promise(r => setTimeout(r, wait));
+      attempt++;
+      continue;
+    }
+    break;
+  }
   if (data.object === "error" || data.error) throw new Error(data.error?.message || JSON.stringify(data));
 
   const msg  = data.choices[0].message;
