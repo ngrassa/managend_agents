@@ -15,7 +15,7 @@ on:
   pull_request:
     branches: [master, production]
   schedule:
-    - cron: "0 6 * * 1"   # Chaque lundi à 6h UTC
+    - cron: "30 7 * * *"   # Chaque jour à 8h30 heure Paris (UTC+1 hiver / UTC+2 été)
 
 # ─────────────────────────────────────────────
 # JOB 1 — Scan Trivy direct (images + manifests)
