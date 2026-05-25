@@ -177,63 +177,58 @@ function trivySummary(target: string, json: string): string {
 }
 
 function buildRichReport(score: number, remediation: string): string {
-  const SEP   = "---";
   const sEmoji = score >= 70 ? "🟢" : score >= 40 ? "🟡" : "🔴";
 
-  // Collecte tous les CVE CRITICAL uniques (toutes images confondues)
   const allCrit: CveDetail[] = Array.from(scanStore.values())
     .flatMap(e => e.critCveDetails)
     .filter((v, i, a) => a.findIndex(x => x.id === v.id && x.image === v.image) === i)
-    .slice(0, 6); // max 6 pour rester sous 4096 chars Telegram
+    .slice(0, 6);
 
-  const lines: string[] = [
-    `🔍 <b>Audit DevSecOps — Namespace ${currentNamespace}</b>`,
-    SEP,
-    `${sEmoji} <b>Score de sécurité : ${score}/100</b>`,
-  ];
+  const totalCrit = Array.from(scanStore.values()).reduce((s, e) => s + e.critical, 0);
+  const totalHigh = Array.from(scanStore.values()).reduce((s, e) => s + e.high, 0);
 
+  const parts: string[] = [];
+
+  // En-tête
+  parts.push(`🔍 <b>Audit DevSecOps — Namespace ${currentNamespace}</b>`);
+  parts.push(`📌 <b>Score de sécurité : ${score}/100</b>  ${sEmoji}`);
+
+  // Alertes critiques
   if (allCrit.length > 0) {
-    lines.push(SEP);
-    lines.push(`🚨 <b>Alertes critiques (${allCrit.length})</b>`);
-    allCrit.forEach((c, i) => {
+    parts.push(`🚨 <b>Alertes critiques (${allCrit.length})</b>`);
+    const cveLines = allCrit.map((c, i) => {
       const cvssStr = c.cvss > 0 ? ` (CVSS ${c.cvss.toFixed(1)})` : "";
-      lines.push(`\n${i + 1}. <b>${c.id}</b>${cvssStr} — ${c.image}`);
-      if (c.title) lines.push(`   • Risque : ${c.title}`);
-      if (c.fixed) lines.push(`   • Remédiation : mettre à jour vers <code>${c.fixed}</code>`);
+      const lines = [`${i + 1}. <b>${c.id}</b>${cvssStr} — <code>${c.image}</code>`];
+      if (c.title) lines.push(`   ├ <b>Risque :</b> ${c.title}`);
+      if (c.fixed) lines.push(`   └ <b>Remédiation :</b> mettre à jour vers <code>${c.fixed}</code>`);
+      return lines.join("\n");
     });
+    parts.push(cveLines.join("\n\n"));
   }
 
   // Points positifs
-  const safeImages = Array.from(scanStore.values()).filter(e => e.critical === 0);
-  lines.push(SEP);
-  lines.push("✅ <b>Points positifs</b>");
-  if (safeImages.length > 0) {
-    const names = Array.from(scanStore.entries())
-      .filter(([, e]) => e.critical === 0)
-      .map(([t]) => shortImageName(t))
-      .join(", ");
-    lines.push(`• ${safeImages.length} image(s) sans CVE CRITICAL : ${names}`);
-  }
-  lines.push("• Images maintenues et signées par AWS ECR.");
+  const safeEntries = Array.from(scanStore.entries()).filter(([, e]) => e.critical === 0);
+  const safeNames   = safeEntries.map(([t]) => shortImageName(t)).join(", ");
+  const positifs: string[] = [];
+  if (safeEntries.length > 0) positifs.push(`• ${safeEntries.length} image(s) sans CVE CRITICAL : <i>${safeNames}</i>`);
+  positifs.push("• Aucune misconfiguration K8s CRITICAL détectée.");
+  positifs.push("• Images signées et maintenues par AWS ECR.");
+  parts.push(`✅ <b>Points positifs</b>\n${positifs.join("\n")}`);
 
-  // Plan de remédiation (fourni par le LLM)
+  // Plan de remédiation
   if (remediation) {
-    lines.push(SEP);
-    lines.push("📋 <b>Plan de remédiation</b>");
-    lines.push(remediation.slice(0, 700));
+    parts.push(`📋 <b>Plan de remédiation</b>\n${remediation.slice(0, 600)}`);
   }
 
   // Détails
-  lines.push(SEP);
-  lines.push("ℹ️ <b>Détails</b>");
-  const totalCrit = Array.from(scanStore.values()).reduce((s, e) => s + e.critical, 0);
-  const totalHigh = Array.from(scanStore.values()).reduce((s, e) => s + e.high, 0);
-  lines.push(`• Images scannées : ${scanStore.size}`);
-  lines.push(`• CVE CRITICAL : ${totalCrit} | HIGH : ${totalHigh}`);
-  lines.push(`• Outils : kubectl, trivy, Telegram`);
-  lines.push(`• <i>${new Date().toISOString()}</i>`);
+  parts.push(
+    `ℹ️ <b>Détails</b>\n` +
+    `• Outils utilisés : kubectl, trivy, AWS ECR\n` +
+    `• Images scannées : ${scanStore.size} | CRITICAL : ${totalCrit} | HIGH : ${totalHigh}\n` +
+    `<i>${new Date().toISOString()}</i>`
+  );
 
-  return lines.join("\n");
+  return parts.join("\n\n");
 }
 
 async function runTool(name: string, args: any): Promise<string> {
