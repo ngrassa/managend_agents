@@ -169,22 +169,18 @@ function shortImageName(target: string): string {
 function buildScanTable(): string {
   if (scanStore.size === 0) return "";
   const rows = Array.from(scanStore.entries()).map(([target, d]) => ({
-    name: shortImageName(target),
+    name:     shortImageName(target),
     critical: d.critical,
     high:     d.high,
-    cves:     d.critCves.length > 0 ? d.critCves[0] : "-",
+    cve:      d.critCves.length > 0 ? d.critCves[0] : "-",
   }));
-  const W = Math.max(...rows.map(r => r.name.length), 5);
-  const sep = (l: string, m: string, r: string) =>
-    `${l}${"─".repeat(W + 2)}┼──────────┼──────┼──────────────────────${r}`;
-  const top = `┌${"─".repeat(W + 2)}┬──────────┬──────┬──────────────────────┐`;
-  const hdr = `│ ${"Image".padEnd(W)} │ CRITICAL │ HIGH │ CVE CRITICAL (1er)   │`;
-  const mid = sep("├", "┼", "┤");
-  const bot = `└${"─".repeat(W + 2)}┴──────────┴──────┴──────────────────────┘`;
+  const W   = Math.max(...rows.map(r => r.name.length), 5);
+  const sep = `+${"-".repeat(W + 2)}+----------+------+----------------------+`;
+  const hdr = `| ${"Image".padEnd(W)} | CRITICAL | HIGH | CVE CRITICAL (1er)   |`;
   const dataRows = rows.map(r =>
-    `│ ${r.name.padEnd(W)} │${String(r.critical).padStart(8)} │${String(r.high).padStart(4)} │ ${r.cves.padEnd(20)} │`
+    `| ${r.name.padEnd(W)} |${String(r.critical).padStart(8)} |${String(r.high).padStart(4)} | ${r.cve.padEnd(20)} |`
   );
-  return [top, hdr, mid, ...dataRows, bot].join("\n");
+  return [sep, hdr, sep, ...dataRows, sep].join("\n");
 }
 
 async function runTool(name: string, args: any): Promise<string> {
