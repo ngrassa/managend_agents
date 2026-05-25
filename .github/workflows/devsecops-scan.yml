@@ -17,14 +17,181 @@ on:
   schedule:
     - cron: "0 6 * * 1"   # Chaque lundi à 6h UTC
 
+# ─────────────────────────────────────────────
+# JOB 1 — Scan Trivy direct (images + manifests)
+# ─────────────────────────────────────────────
 jobs:
-  security-scan:
-    name: Audit DevSecOps EKS
+  trivy-scan:
+    name: "Trivy — Scan images & manifests"
     runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+          trivy --version
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Configure kubectl (EKS)
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ secrets.AWS_REGION }} \
+            --name   ${{ secrets.EKS_CLUSTER_NAME }}
+          kubectl get nodes
+
+      - name: Authenticate Docker to ECR
+        run: |
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
+            | docker login --username AWS --password-stdin \
+              $(aws sts get-caller-identity --query Account --output text).dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+
+      # ── Scan des images déployées ────────────────────────────────────────
+      - name: Extract pod images from all namespaces
+        id: images
+        run: |
+          IMAGES=$(kubectl get pods --all-namespaces \
+            -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.image}{"\n"}{end}{end}' \
+            | sort -u)
+          echo "Found images:"
+          echo "$IMAGES"
+          echo "images<<EOF" >> $GITHUB_OUTPUT
+          echo "$IMAGES"    >> $GITHUB_OUTPUT
+          echo "EOF"        >> $GITHUB_OUTPUT
+
+      - name: Scan images with trivy
+        run: |
+          mkdir -p trivy-results
+          echo "# Trivy Image Scan — $(date -u '+%Y-%m-%d %H:%M:%S UTC')" > trivy.log
+          echo "Cluster : ${{ secrets.EKS_CLUSTER_NAME }} | Region : ${{ secrets.AWS_REGION }}" >> trivy.log
+          echo "================================================" >> trivy.log
+
+          while IFS= read -r IMAGE; do
+            [ -z "$IMAGE" ] && continue
+            echo ""                                          >> trivy.log
+            echo "## Image: $IMAGE"                         >> trivy.log
+            echo "-------------------------------------------" >> trivy.log
+
+            SAFE_NAME=$(echo "$IMAGE" | tr '/:.' '-')
+            trivy image \
+              --severity   CRITICAL,HIGH \
+              --format     table \
+              --cache-dir  /tmp/trivy-cache \
+              --no-progress \
+              "$IMAGE" 2>&1 | tee -a trivy.log "trivy-results/${SAFE_NAME}.txt" || true
+
+            # JSON séparé pour le parsing
+            trivy image \
+              --severity   CRITICAL,HIGH \
+              --format     json \
+              --cache-dir  /tmp/trivy-cache \
+              --no-progress \
+              --output     "trivy-results/${SAFE_NAME}.json" \
+              "$IMAGE" 2>/dev/null || true
+
+          done <<< "${{ steps.images.outputs.images }}"
+
+          echo ""                                           >> trivy.log
+          echo "================================================" >> trivy.log
+          echo "Scan terminé : $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> trivy.log
+
+      # ── Scan des manifests K8s ────────────────────────────────────────────
+      - name: Dump K8s manifests
+        run: |
+          mkdir -p k8s-manifests
+          for NS in $(kubectl get ns -o jsonpath='{.items[*].metadata.name}'); do
+            kubectl get all -n $NS -o yaml > k8s-manifests/${NS}.yaml 2>/dev/null || true
+          done
+
+      - name: Scan K8s manifests with trivy
+        run: |
+          echo ""                                           >> trivy.log
+          echo "# Trivy Manifest Scan (misconfigurations)"  >> trivy.log
+          echo "================================================" >> trivy.log
+
+          trivy config \
+            --severity   CRITICAL,HIGH,MEDIUM \
+            --format     table \
+            --cache-dir  /tmp/trivy-cache \
+            k8s-manifests/ 2>&1 | tee -a trivy.log "trivy-results/manifests.txt" || true
+
+          # JSON pour le parsing
+          trivy config \
+            --severity   CRITICAL,HIGH,MEDIUM \
+            --format     json \
+            --cache-dir  /tmp/trivy-cache \
+            --output     trivy-results/manifests.json \
+            k8s-manifests/ 2>/dev/null || true
+
+      # ── GitHub Job Summary ────────────────────────────────────────────────
+      - name: Write GitHub Actions summary
+        if: always()
+        run: |
+          CRITICAL_COUNT=$(grep -c "CRITICAL" trivy.log 2>/dev/null || echo 0)
+          HIGH_COUNT=$(grep -c "HIGH" trivy.log 2>/dev/null || echo 0)
+
+          echo "## 🔍 Trivy Security Scan" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Métrique | Valeur |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔴 CRITICAL | $CRITICAL_COUNT |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🟠 HIGH | $HIGH_COUNT |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📅 Date | $(date -u '+%Y-%m-%d %H:%M UTC') |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🏗️ Cluster | ${{ secrets.EKS_CLUSTER_NAME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Extrait du log" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -E "CRITICAL|HIGH|Image:|Total:" trivy.log | head -40 >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      # ── Upload artifacts ──────────────────────────────────────────────────
+      - name: Upload trivy.log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-log
+          path: trivy.log
+          retention-days: 30
+
+      - name: Upload trivy detailed results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results
+          path: trivy-results/
+          retention-days: 30
+
+      # ── Fail si CRITICAL ──────────────────────────────────────────────────
+      - name: Fail on CRITICAL findings
+        run: |
+          if grep -q "^| CRITICAL" trivy.log 2>/dev/null; then
+            echo "❌ CVEs CRITICAL détectés — voir trivy.log dans les artifacts"
+            exit 1
+          fi
+          echo "✅ Aucun CVE CRITICAL"
+
+# ─────────────────────────────────────────────
+# JOB 2 — Agent IA (analyse + alertes Telegram)
+# ─────────────────────────────────────────────
+  ai-scan:
+    name: "Agent IA — Analyse & Alertes Telegram"
+    runs-on: ubuntu-latest
+    needs: trivy-scan    # attend que trivy-scan soit terminé
+    if: always()         # tourne même si trivy-scan trouve des CVEs
 
     strategy:
       matrix:
-        namespace: [default, production, staging]
+        namespace: ${{ fromJson(github.event.inputs.namespace != '' && format('["{0}"]', github.event.inputs.namespace) || '["default","kube-system"]') }}
 
     steps:
       - name: Checkout
@@ -39,59 +206,52 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build MCP servers
-        run: |
-          cd mcp-kubectl  && npm ci && npm run build && cd ..
-          cd mcp-trivy    && npm ci && npm run build && cd ..
-          cd mcp-telegram && npm ci && npm run build && cd ..
-
       - name: Install trivy
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
 
-      - name: Configure AWS credentials (AWS Academy — avec session token)
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Configurer la clé SSH (labsuser.pem / vockey)
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/labsuser.pem
-          chmod 400 ~/.ssh/labsuser.pem
-          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ secrets.AWS_REGION }}
 
       - name: Configure kubectl (EKS)
         run: |
           aws eks update-kubeconfig \
             --region ${{ secrets.AWS_REGION }} \
-            --name ${{ secrets.EKS_CLUSTER_NAME }}
-          kubectl get nodes
+            --name   ${{ secrets.EKS_CLUSTER_NAME }}
 
-      - name: Run DevSecOps Agent Scan
-        run: npx ts-node scan-local.ts ${{ github.event.inputs.namespace || matrix.namespace }}
+      - name: Authenticate Docker to ECR
+        run: |
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
+            | docker login --username AWS --password-stdin \
+              $(aws sts get-caller-identity --query Account --output text).dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+
+      - name: Download trivy.log from previous job
+        uses: actions/download-artifact@v4
+        with:
+          name: trivy-log
+        continue-on-error: true
+
+      - name: Run AI Agent scan
+        run: npx ts-node scan-local.ts ${{ matrix.namespace }}
         env:
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          AGENT_ID: ${{ secrets.CLAUDE_AGENT_ID }}
+          MISTRAL_API_KEY:    ${{ secrets.MISTRAL_API_KEY }}
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          AWS_REGION:         ${{ secrets.AWS_REGION }}
 
-      - name: Upload Security Report
+      - name: Upload AI security report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: security-report-${{ matrix.namespace }}
-          path: reports/security-report-*.md
+          name: ai-report-${{ matrix.namespace }}
+          path: |
+            reports/security-report-*.md
+            trivy.log
           retention-days: 30
-
-      - name: Fail on critical findings
-        run: |
-          if grep -q "CRITICAL" reports/security-report-*.md 2>/dev/null; then
-            echo "❌ CVEs critiques détectés — voir le rapport"
-            exit 1
-          fi

@@ -2,11 +2,18 @@
  * Scan DevSecOps local — supporte Mistral et Anthropic.
  * Priorité : MISTRAL_API_KEY → ANTHROPIC_API_KEY
  * Usage : npx ts-node scan-local.ts [namespace]
+ * Résultats trivy écrits dans trivy.log
  */
 import { exec }     from "child_process";
 import { promisify } from "util";
 import * as fs      from "fs";
 import * as path    from "path";
+
+const TRIVY_LOG = path.resolve("trivy.log");
+
+function appendTrivyLog(content: string) {
+  fs.appendFileSync(TRIVY_LOG, content + "\n");
+}
 
 const execAsync = promisify(exec);
 
@@ -130,16 +137,31 @@ async function runTool(name: string, args: any): Promise<string> {
     case "trivy_scan_image": {
       const sev   = args.severity || "CRITICAL,HIGH";
       const cache = `/tmp/trivy-cache-${process.pid}`;
-      const cmd   = `trivy image --severity ${sev} --format json --quiet --cache-dir ${cache} ${args.image}`;
-      try { const { stdout } = await execAsync(cmd, { timeout: 120000, maxBuffer: 10 * 1024 * 1024 }); return stdout || "{}"; }
-      catch (e: any) { return e.stdout || e.message; }
+      // Format table pour le log lisible + JSON pour l'analyse
+      const cmdTable = `trivy image --severity ${sev} --format table --no-progress --cache-dir ${cache} ${args.image}`;
+      const cmdJson  = `trivy image --severity ${sev} --format json  --quiet     --cache-dir ${cache} ${args.image}`;
+      try {
+        const [{ stdout: table }, { stdout: json }] = await Promise.all([
+          execAsync(cmdTable, { timeout: 120000, maxBuffer: 10 * 1024 * 1024 }).catch((e: any) => ({ stdout: e.stdout || "" })),
+          execAsync(cmdJson,  { timeout: 120000, maxBuffer: 10 * 1024 * 1024 }).catch((e: any) => ({ stdout: e.stdout || "{}" })),
+        ]);
+        appendTrivyLog(`\n## Image: ${args.image}\n${"─".repeat(60)}\n${table}`);
+        return json || "{}";
+      } catch (e: any) { return e.stdout || e.message; }
     }
 
     case "trivy_scan_manifest": {
-      const cache = `/tmp/trivy-cache-${process.pid}`;
-      const cmd   = `trivy config --format json --quiet --cache-dir ${cache} ${args.path}`;
-      try { const { stdout } = await execAsync(cmd, { timeout: 60000 }); return stdout || "{}"; }
-      catch (e: any) { return e.stdout || e.message; }
+      const cache  = `/tmp/trivy-cache-${process.pid}`;
+      const cmdTbl = `trivy config --severity CRITICAL,HIGH,MEDIUM --format table --no-progress --cache-dir ${cache} ${args.path}`;
+      const cmdJs  = `trivy config --severity CRITICAL,HIGH,MEDIUM --format json  --quiet     --cache-dir ${cache} ${args.path}`;
+      try {
+        const [{ stdout: table }, { stdout: json }] = await Promise.all([
+          execAsync(cmdTbl, { timeout: 60000 }).catch((e: any) => ({ stdout: e.stdout || "" })),
+          execAsync(cmdJs,  { timeout: 60000 }).catch((e: any) => ({ stdout: e.stdout || "{}" })),
+        ]);
+        appendTrivyLog(`\n## Manifests: ${args.path}\n${"─".repeat(60)}\n${table}`);
+        return json || "{}";
+      } catch (e: any) { return e.stdout || e.message; }
     }
 
     case "telegram_alert_critical": {
@@ -187,6 +209,14 @@ async function sendTelegram(text: string): Promise<string> {
 async function runDevSecOpsScan(namespace: string = "default") {
   console.log(`\n🚀 Audit DevSecOps — namespace: ${namespace} [${PROVIDER}]`);
   console.log(`⏰ ${new Date().toISOString()}\n`);
+
+  // Initialise trivy.log
+  fs.writeFileSync(TRIVY_LOG,
+    `# Trivy Scan Log — namespace: ${namespace}\n` +
+    `# Date    : ${new Date().toISOString()}\n` +
+    `# Provider: ${PROVIDER}\n` +
+    `${"=".repeat(60)}\n`
+  );
 
   const TASK = `Lance un audit DevSecOps complet sur le namespace Kubernetes "${namespace}".
 1. Liste pods et deployments (kubectl_get)
@@ -254,9 +284,15 @@ async function runDevSecOpsScan(namespace: string = "default") {
   const reportPath = path.join(dir, `security-report-${namespace}-${Date.now()}.md`);
   fs.writeFileSync(reportPath, fullReport);
 
+  // Footer trivy.log
+  appendTrivyLog(`\n${"=".repeat(60)}`);
+  appendTrivyLog(`# Scan terminé : ${new Date().toISOString()}`);
+  appendTrivyLog(`# Outils utilisés : ${[...new Set(toolsUsed)].join(", ")}`);
+
   console.log("\n" + "─".repeat(50));
-  console.log(`📄 Rapport : ${reportPath}`);
-  console.log(`🔧 Outils  : ${[...new Set(toolsUsed)].join(", ")}`);
+  console.log(`📄 Rapport  : ${reportPath}`);
+  console.log(`📋 Trivy log: ${TRIVY_LOG}`);
+  console.log(`🔧 Outils   : ${[...new Set(toolsUsed)].join(", ")}`);
   console.log("─".repeat(50));
 }
 
