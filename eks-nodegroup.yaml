@@ -1,0 +1,21 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: eks-devsecops
+  region: us-east-1
+
+managedNodeGroups:
+  - name: ng-devsecops
+    instanceType: t3.medium
+    minSize: 1
+    maxSize: 3
+    desiredCapacity: 2
+    volumeSize: 20
+    ssh:
+      allow: true
+      publicKeyName: vockey
+    labels:
+      role: worker
+    iam:
+      instanceRoleARN: arn:aws:iam::397608651921:role/c208559a5301072l14970659t1w397608651-LabEksNodeRole-JOzkVjgrCyxo
