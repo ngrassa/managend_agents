@@ -1,0 +1,89 @@
+name: DevSecOps K8s Scan
+
+on:
+  push:
+    paths:
+      - "k8s/**/*.yaml"
+      - "k8s/**/*.yml"
+  pull_request:
+    branches: [master, production]
+  schedule:
+    - cron: "0 6 * * 1"   # Chaque lundi à 6h UTC
+
+jobs:
+  security-scan:
+    name: Audit DevSecOps EKS
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        namespace: [default, production, staging]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build MCP servers
+        run: |
+          cd mcp-kubectl && npm ci && npm run build && cd ..
+          cd mcp-trivy   && npm ci && npm run build && cd ..
+          cd mcp-slack   && npm ci && npm run build && cd ..
+
+      - name: Install trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Configure AWS credentials (AWS Academy — avec session token)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Configurer la clé SSH (labsuser.pem / vockey)
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/labsuser.pem
+          chmod 400 ~/.ssh/labsuser.pem
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+
+      - name: Configure kubectl (EKS)
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ secrets.AWS_REGION }} \
+            --name ${{ secrets.EKS_CLUSTER_NAME }}
+          kubectl get nodes
+
+      - name: Run DevSecOps Agent Scan
+        run: npx ts-node main.ts ${{ matrix.namespace }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AGENT_ID: ${{ secrets.CLAUDE_AGENT_ID }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+
+      - name: Upload Security Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report-${{ matrix.namespace }}
+          path: reports/security-report-*.md
+          retention-days: 30
+
+      - name: Fail on critical findings
+        run: |
+          if grep -q "CRITICAL" reports/security-report-*.md 2>/dev/null; then
+            echo "❌ CVEs critiques détectés — voir le rapport"
+            exit 1
+          fi

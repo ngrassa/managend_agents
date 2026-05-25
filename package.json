@@ -1,0 +1,24 @@
+{
+  "name": "managend-agents",
+  "version": "1.0.0",
+  "description": "DevSecOps K8s Agent avec Claude Managed Agents + MCP + Slack",
+  "main": "main.ts",
+  "scripts": {
+    "start": "ts-node main.ts",
+    "build": "tsc",
+    "audit": "ts-node main.ts",
+    "build:all": "cd mcp-kubectl && npm ci && npm run build && cd ../mcp-trivy && npm ci && npm run build && cd ../mcp-slack && npm ci && npm run build && cd .."
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.55.0",
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
