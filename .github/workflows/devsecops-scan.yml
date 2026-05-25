@@ -1,6 +1,13 @@
 name: DevSecOps K8s Scan
 
 on:
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: "Namespace K8s à auditer"
+        required: false
+        default: "default"
+        type: string
   push:
     paths:
       - "k8s/**/*.yaml"
