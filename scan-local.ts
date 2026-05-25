@@ -117,6 +117,31 @@ async function callAnthropic(messages: Message[]): Promise<{ text: string; toolC
 
 // ── Exécuteurs d'outils ───────────────────────────────────────────────────
 
+function trivySummary(target: string, json: string): string {
+  try {
+    const parsed = JSON.parse(json || "{}");
+    const vulns  = (parsed.Results || []).flatMap((r: any) => r.Vulnerabilities || []);
+    if (vulns.length === 0) return JSON.stringify({ target, total: 0, critical: 0, high: 0, cves: [] });
+    const cves = vulns.map((v: any) => ({
+      id:       v.VulnerabilityID,
+      severity: v.Severity,
+      pkg:      v.PkgName,
+      title:    (v.Title || "").slice(0, 60),
+      fixed:    v.FixedVersion || "no fix",
+    })).slice(0, 25);
+    return JSON.stringify({
+      target,
+      total:    vulns.length,
+      critical: vulns.filter((v: any) => v.Severity === "CRITICAL").length,
+      high:     vulns.filter((v: any) => v.Severity === "HIGH").length,
+      medium:   vulns.filter((v: any) => v.Severity === "MEDIUM").length,
+      cves,
+    });
+  } catch {
+    return json?.slice(0, 1500) || "{}";
+  }
+}
+
 async function runTool(name: string, args: any): Promise<string> {
   switch (name) {
 
@@ -137,7 +162,6 @@ async function runTool(name: string, args: any): Promise<string> {
     case "trivy_scan_image": {
       const sev   = args.severity || "CRITICAL,HIGH";
       const cache = `/tmp/trivy-cache-${process.pid}`;
-      // Format table pour le log lisible + JSON pour l'analyse
       const cmdTable = `trivy image --severity ${sev} --format table --no-progress --cache-dir ${cache} ${args.image}`;
       const cmdJson  = `trivy image --severity ${sev} --format json  --quiet     --cache-dir ${cache} ${args.image}`;
       try {
@@ -146,7 +170,8 @@ async function runTool(name: string, args: any): Promise<string> {
           execAsync(cmdJson,  { timeout: 120000, maxBuffer: 10 * 1024 * 1024 }).catch((e: any) => ({ stdout: e.stdout || "{}" })),
         ]);
         appendTrivyLog(`\n## Image: ${args.image}\n${"─".repeat(60)}\n${table}`);
-        return json || "{}";
+        // Return compact summary (not raw JSON) to avoid token bloat
+        return trivySummary(args.image, json);
       } catch (e: any) { return e.stdout || e.message; }
     }
 
@@ -160,7 +185,7 @@ async function runTool(name: string, args: any): Promise<string> {
           execAsync(cmdJs,  { timeout: 60000 }).catch((e: any) => ({ stdout: e.stdout || "{}" })),
         ]);
         appendTrivyLog(`\n## Manifests: ${args.path}\n${"─".repeat(60)}\n${table}`);
-        return json || "{}";
+        return trivySummary(args.path, json);
       } catch (e: any) { return e.stdout || e.message; }
     }
 
