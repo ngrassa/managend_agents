@@ -38,7 +38,7 @@ async function runDevSecOpsScan(namespace: string = "default") {
 
   // 2. Ouvrir une session agent
   const session = await api("POST", "/sessions", {
-    agent_id: AGENT_ID,
+    agent: AGENT_ID,
     environment_id: environment.id,
     title: `DevSecOps Audit — ${namespace} — ${new Date().toISOString()}`,
   });
