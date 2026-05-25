@@ -1,97 +1,102 @@
 /**
- * Mode local : scan DevSecOps sans Managed Agents.
- * Appelle kubectl et trivy directement, envoie via Telegram.
- * Utilise l'API messages Claude avec tool_use pour le raisonnement.
+ * Scan DevSecOps local — supporte Mistral et Anthropic.
+ * Priorité : MISTRAL_API_KEY → ANTHROPIC_API_KEY
+ * Usage : npx ts-node scan-local.ts [namespace]
  */
-import Anthropic from "@anthropic-ai/sdk";
-import { exec }  from "child_process";
+import { exec }     from "child_process";
 import { promisify } from "util";
-import * as fs   from "fs";
-import * as path from "path";
+import * as fs      from "fs";
+import * as path    from "path";
 
 const execAsync = promisify(exec);
-const client    = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-const BOT_TOKEN  = process.env.TELEGRAM_BOT_TOKEN!;
-const CHAT_ID    = process.env.TELEGRAM_CHAT_ID!;
+const MISTRAL_KEY   = process.env.MISTRAL_API_KEY;
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const PROVIDER      = MISTRAL_KEY ? "mistral" : "anthropic";
 
-// ── Outils exposés à Claude ────────────────────────────────────────────────
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
+const TELEGRAM_CHAT  = process.env.TELEGRAM_CHAT_ID!;
 
-const TOOLS: Anthropic.Tool[] = [
-  {
-    name: "kubectl_get",
-    description: "Liste les ressources K8s d'un namespace",
-    input_schema: {
-      type: "object",
-      properties: {
-        resource:  { type: "string" },
-        namespace: { type: "string" },
-        flags:     { type: "string" },
-      },
-      required: ["resource"],
-    },
-  },
-  {
-    name: "kubectl_get_images",
-    description: "Liste toutes les images des pods d'un namespace",
-    input_schema: {
-      type: "object",
-      properties: { namespace: { type: "string" } },
-      required: [],
-    },
-  },
-  {
-    name: "trivy_scan_image",
-    description: "Scanne une image Docker pour des CVEs (CRITICAL,HIGH par défaut)",
-    input_schema: {
-      type: "object",
-      properties: {
-        image:    { type: "string" },
-        severity: { type: "string", default: "CRITICAL,HIGH" },
-      },
-      required: ["image"],
-    },
-  },
-  {
-    name: "trivy_scan_manifest",
-    description: "Scanne les misconfigurations d'un manifest K8s",
-    input_schema: {
-      type: "object",
-      properties: { path: { type: "string" } },
-      required: ["path"],
-    },
-  },
-  {
-    name: "telegram_alert_critical",
-    description: "Envoie une alerte critique sur Telegram",
-    input_schema: {
-      type: "object",
-      properties: {
-        namespace:   { type: "string" },
-        severity:    { type: "string" },
-        cve_list:    { type: "array", items: { type: "string" } },
-        image:       { type: "string" },
-        remediation: { type: "string" },
-      },
-      required: ["namespace", "severity", "cve_list", "image", "remediation"],
-    },
-  },
-  {
-    name: "telegram_send_report",
-    description: "Envoie le rapport de sécurité complet sur Telegram",
-    input_schema: {
-      type: "object",
-      properties: {
-        report_content: { type: "string" },
-        title:          { type: "string" },
-        score:          { type: "number" },
-      },
-      required: ["report_content", "title", "score"],
-    },
-  },
-];
+if (!MISTRAL_KEY && !ANTHROPIC_KEY) {
+  console.error("❌ Aucune clé API — définir MISTRAL_API_KEY ou ANTHROPIC_API_KEY");
+  process.exit(1);
+}
 
-// ── Exécuteurs d'outils ────────────────────────────────────────────────────
+console.log(`🔑 Provider : ${PROVIDER === "mistral" ? "Mistral AI" : "Anthropic Claude"}`);
+
+// ── Définition des outils ─────────────────────────────────────────────────
+
+const TOOLS_ANTHROPIC = [
+  { name: "kubectl_get",       description: "Liste les ressources K8s d'un namespace",                     input_schema: { type: "object", properties: { resource: { type: "string" }, namespace: { type: "string" }, flags: { type: "string" } }, required: ["resource"] } },
+  { name: "kubectl_get_images",description: "Liste toutes les images Docker des pods d'un namespace",       input_schema: { type: "object", properties: { namespace: { type: "string" } }, required: [] } },
+  { name: "trivy_scan_image",  description: "Scanne une image Docker pour des CVEs (CRITICAL,HIGH)",        input_schema: { type: "object", properties: { image: { type: "string" }, severity: { type: "string", default: "CRITICAL,HIGH" } }, required: ["image"] } },
+  { name: "trivy_scan_manifest",description: "Scanne les misconfigurations d'un manifest K8s",             input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } },
+  { name: "telegram_alert_critical", description: "Envoie une alerte critique de sécurité sur Telegram",   input_schema: { type: "object", properties: { namespace: { type: "string" }, severity: { type: "string" }, cve_list: { type: "array", items: { type: "string" } }, image: { type: "string" }, remediation: { type: "string" } }, required: ["namespace","severity","cve_list","image","remediation"] } },
+  { name: "telegram_send_report", description: "Envoie le rapport de sécurité complet sur Telegram",       input_schema: { type: "object", properties: { report_content: { type: "string" }, title: { type: "string" }, score: { type: "number" } }, required: ["report_content","title","score"] } },
+] as const;
+
+const TOOLS_MISTRAL = TOOLS_ANTHROPIC.map(t => ({
+  type: "function" as const,
+  function: {
+    name:        t.name,
+    description: t.description,
+    parameters:  (t as any).input_schema,
+  },
+}));
+
+// ── Appel LLM ─────────────────────────────────────────────────────────────
+
+const SYSTEM = `Tu es un expert DevSecOps spécialisé AWS EKS.
+Utilise les outils pour inspecter le cluster, scanner les vulnérabilités et alerter via Telegram.
+Sois méthodique : utilise les vrais résultats des outils pour ton analyse.`;
+
+type Message = { role: string; content: any; tool_call_id?: string; name?: string };
+
+async function callMistral(messages: Message[]): Promise<{ text: string; toolCalls: any[] }> {
+  const res  = await fetch("https://api.mistral.ai/v1/chat/completions", {
+    method:  "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${MISTRAL_KEY}` },
+    body: JSON.stringify({
+      model:       "mistral-large-latest",
+      messages:    [{ role: "system", content: SYSTEM }, ...messages],
+      tools:       TOOLS_MISTRAL,
+      tool_choice: "auto",
+    }),
+  });
+  const data = await res.json() as any;
+  if (data.object === "error" || data.error) throw new Error(data.error?.message || JSON.stringify(data));
+
+  const msg  = data.choices[0].message;
+  const text = msg.content || "";
+  const toolCalls = (msg.tool_calls || []).map((tc: any) => ({
+    id:    tc.id,
+    name:  tc.function.name,
+    input: JSON.parse(tc.function.arguments || "{}"),
+  }));
+  return { text, toolCalls };
+}
+
+async function callAnthropic(messages: Message[]): Promise<{ text: string; toolCalls: any[]; stopReason: string }> {
+  const Anthropic = (await import("@anthropic-ai/sdk")).default;
+  const client    = new Anthropic({ apiKey: ANTHROPIC_KEY });
+
+  const res = await client.messages.create({
+    model:      "claude-sonnet-4-6",
+    max_tokens: 4096,
+    system:     SYSTEM,
+    tools:      TOOLS_ANTHROPIC as any,
+    messages:   messages as any,
+  });
+
+  const text = res.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("");
+  const toolCalls = res.content.filter((b: any) => b.type === "tool_use").map((b: any) => ({
+    id: b.id, name: b.name, input: b.input,
+    _raw: b,
+  }));
+  return { text, toolCalls, stopReason: res.stop_reason };
+}
+
+// ── Exécuteurs d'outils ───────────────────────────────────────────────────
 
 async function runTool(name: string, args: any): Promise<string> {
   switch (name) {
@@ -99,41 +104,33 @@ async function runTool(name: string, args: any): Promise<string> {
     case "kubectl_get": {
       const ns  = args.namespace ? `-n ${args.namespace}` : "--all-namespaces";
       const cmd = `kubectl get ${args.resource} ${ns} ${args.flags || ""}`;
-      try {
-        const { stdout, stderr } = await execAsync(cmd, { timeout: 30000 });
-        return stdout || stderr || "(vide)";
-      } catch (e: any) { return `ERREUR kubectl: ${e.message}`; }
+      try { const { stdout, stderr } = await execAsync(cmd, { timeout: 30000 }); return stdout || stderr || "(vide)"; }
+      catch (e: any) { return `ERREUR kubectl: ${e.message}`; }
     }
 
     case "kubectl_get_images": {
       const ns  = args.namespace ? `-n ${args.namespace}` : "--all-namespaces";
       const cmd = `kubectl get pods ${ns} -o jsonpath="{range .items[*]}{.metadata.name}{'\\t'}{range .spec.containers[*]}{.image}{' '}{end}{'\\n'}{end}"`;
-      try {
-        const { stdout } = await execAsync(cmd, { timeout: 30000 });
-        return stdout || "(aucun pod)";
-      } catch (e: any) { return `ERREUR kubectl: ${e.message}`; }
+      try { const { stdout } = await execAsync(cmd, { timeout: 30000 }); return stdout || "(aucun pod)"; }
+      catch (e: any) { return `ERREUR kubectl: ${e.message}`; }
     }
 
     case "trivy_scan_image": {
       const sev = args.severity || "CRITICAL,HIGH";
       const cmd = `trivy image --severity ${sev} --format json --quiet ${args.image}`;
-      try {
-        const { stdout } = await execAsync(cmd, { timeout: 120000, maxBuffer: 10 * 1024 * 1024 });
-        return stdout || "{}";
-      } catch (e: any) { return e.stdout || e.message; }
+      try { const { stdout } = await execAsync(cmd, { timeout: 120000, maxBuffer: 10 * 1024 * 1024 }); return stdout || "{}"; }
+      catch (e: any) { return e.stdout || e.message; }
     }
 
     case "trivy_scan_manifest": {
       const cmd = `trivy config --format json --quiet ${args.path}`;
-      try {
-        const { stdout } = await execAsync(cmd, { timeout: 60000 });
-        return stdout || "{}";
-      } catch (e: any) { return e.stdout || e.message; }
+      try { const { stdout } = await execAsync(cmd, { timeout: 60000 }); return stdout || "{}"; }
+      catch (e: any) { return e.stdout || e.message; }
     }
 
     case "telegram_alert_critical": {
       const emoji = args.severity === "CRITICAL" ? "🔴" : args.severity === "HIGH" ? "🟠" : "🟡";
-      const cves  = (args.cve_list as string[]).map((c: string) => `• <code>${c}</code>`).join("\n");
+      const cves  = (args.cve_list as string[]).map(c => `• <code>${c}</code>`).join("\n");
       const text  = [
         `${emoji} <b>Alerte DevSecOps — ${args.severity}</b>`,
         `<b>Namespace :</b> <code>${args.namespace}</code>`,
@@ -156,85 +153,85 @@ async function runTool(name: string, args: any): Promise<string> {
       return await sendTelegram(text);
     }
 
-    default:
-      return `Outil inconnu : ${name}`;
+    default: return `Outil inconnu : ${name}`;
   }
 }
 
 async function sendTelegram(text: string): Promise<string> {
-  if (!BOT_TOKEN || BOT_TOKEN.includes("PLACEHOLDER")) return "⚠️  TELEGRAM_BOT_TOKEN non configuré";
-  const res  = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+  if (!TELEGRAM_TOKEN || TELEGRAM_TOKEN.includes("PLACEHOLDER")) return "⚠️ TELEGRAM_BOT_TOKEN non configuré";
+  const res  = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
-    body:    JSON.stringify({ chat_id: CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true }),
+    body:    JSON.stringify({ chat_id: TELEGRAM_CHAT, text, parse_mode: "HTML", disable_web_page_preview: true }),
   });
   const data = await res.json() as any;
-  return data.ok ? `✅ Telegram envoyé (msg ${data.result?.message_id})` : `❌ Erreur Telegram: ${data.description}`;
+  return data.ok ? `✅ Telegram msg ${data.result?.message_id}` : `❌ Telegram: ${data.description}`;
 }
 
-// ── Boucle agent ───────────────────────────────────────────────────────────
+// ── Boucle agent ──────────────────────────────────────────────────────────
 
 async function runDevSecOpsScan(namespace: string = "default") {
-  console.log(`\n🚀 Audit DevSecOps local — namespace: ${namespace}`);
+  console.log(`\n🚀 Audit DevSecOps — namespace: ${namespace} [${PROVIDER}]`);
   console.log(`⏰ ${new Date().toISOString()}\n`);
 
-  const messages: Anthropic.MessageParam[] = [
-    {
-      role: "user",
-      content: `Lance un audit DevSecOps complet sur le namespace Kubernetes "${namespace}".
-
-Processus :
-1. Liste les pods et deployments (kubectl_get)
+  const TASK = `Lance un audit DevSecOps complet sur le namespace Kubernetes "${namespace}".
+1. Liste pods et deployments (kubectl_get)
 2. Extrait toutes les images (kubectl_get_images)
 3. Scanne chaque image avec trivy (CRITICAL,HIGH)
-4. Si CVE CRITICAL → alerte Telegram immédiate (telegram_alert_critical)
+4. Alerte Telegram immédiate pour chaque CVE CRITICAL (telegram_alert_critical)
 5. Génère un rapport final avec score /100 et plan de remédiation
-6. Envoie le rapport sur Telegram (telegram_send_report)`,
-    },
-  ];
+6. Envoie le rapport sur Telegram (telegram_send_report)`;
 
-  const SYSTEM = `Tu es un expert DevSecOps spécialisé AWS EKS.
-Tu utilises les outils pour inspecter le cluster, scanner les vulnérabilités et alerter via Telegram.
-Sois méthodique : invente rien, utilise les vrais résultats des outils pour ton analyse.`;
-
+  const messages: Message[] = [{ role: "user", content: TASK }];
   let fullReport = "";
-  let round      = 0;
   const toolsUsed: string[] = [];
+  let round = 0;
 
-  while (round < 10) {
-    round++;
-    const response = await client.messages.create({
-      model:      "claude-sonnet-4-6",
-      max_tokens: 4096,
-      system:     SYSTEM,
-      tools:      TOOLS,
-      messages,
-    });
+  while (round++ < 15) {
+    if (PROVIDER === "mistral") {
+      const { text, toolCalls } = await callMistral(messages);
 
-    // Texte de l'agent
-    for (const block of response.content) {
-      if (block.type === "text") {
-        process.stdout.write(block.text);
-        fullReport += block.text;
+      if (text) { process.stdout.write(text); fullReport += text; }
+      if (toolCalls.length === 0) break;
+
+      // Ajouter réponse assistant avec tool_calls au format Mistral
+      messages.push({
+        role: "assistant",
+        content: text || null,
+        ...(toolCalls.length > 0 ? { tool_calls: toolCalls.map(tc => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: JSON.stringify(tc.input) } })) } : {}),
+      } as any);
+
+      // Exécuter les outils et ajouter les résultats
+      for (const tc of toolCalls) {
+        console.log(`\n  🔧 [${tc.name}] ${JSON.stringify(tc.input).slice(0, 80)}`);
+        toolsUsed.push(tc.name);
+        const result = await runTool(tc.name, tc.input);
+        messages.push({ role: "tool", content: result, tool_call_id: tc.id, name: tc.name });
       }
+
+    } else {
+      const { text, toolCalls, stopReason } = await callAnthropic(messages);
+
+      if (text) { process.stdout.write(text); fullReport += text; }
+      if (stopReason === "end_turn" || toolCalls.length === 0) break;
+
+      // Ajouter réponse assistant au format Anthropic
+      const rawContent = toolCalls[0]?._raw
+        ? toolCalls.map(tc => tc._raw)
+        : [];
+      if (text) rawContent.unshift({ type: "text", text });
+      messages.push({ role: "assistant", content: rawContent });
+
+      // Exécuter les outils
+      const results = [];
+      for (const tc of toolCalls) {
+        console.log(`\n  🔧 [${tc.name}] ${JSON.stringify(tc.input).slice(0, 80)}`);
+        toolsUsed.push(tc.name);
+        const result = await runTool(tc.name, tc.input);
+        results.push({ type: "tool_result", tool_use_id: tc.id, content: result });
+      }
+      messages.push({ role: "user", content: results });
     }
-
-    if (response.stop_reason === "end_turn") break;
-    if (response.stop_reason !== "tool_use")  break;
-
-    // Exécuter les outils demandés
-    const toolResults: Anthropic.ToolResultBlockParam[] = [];
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
-      console.log(`\n  🔧 [${block.name}] ${JSON.stringify(block.input).slice(0, 80)}`);
-      toolsUsed.push(block.name);
-      const result = await runTool(block.name, block.input);
-      toolResults.push({ type: "tool_result", tool_use_id: block.id, content: result });
-    }
-
-    // Ajouter la réponse de l'agent + les résultats d'outils à la conversation
-    messages.push({ role: "assistant", content: response.content });
-    messages.push({ role: "user",      content: toolResults });
   }
 
   // Sauvegarde locale
@@ -250,7 +247,7 @@ Sois méthodique : invente rien, utilise les vrais résultats des outils pour to
 }
 
 const namespace = process.argv[2] || "default";
-runDevSecOpsScan(namespace).catch((err) => {
+runDevSecOpsScan(namespace).catch(err => {
   console.error("Erreur :", err.message);
   process.exit(1);
 });

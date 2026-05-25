@@ -72,8 +72,9 @@ jobs:
           kubectl get nodes
 
       - name: Run DevSecOps Agent Scan
-        run: npx ts-node main.ts ${{ matrix.namespace }}
+        run: npx ts-node scan-local.ts ${{ github.event.inputs.namespace || matrix.namespace }}
         env:
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           AGENT_ID: ${{ secrets.CLAUDE_AGENT_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
