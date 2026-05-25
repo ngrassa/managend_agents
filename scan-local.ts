@@ -128,14 +128,16 @@ async function runTool(name: string, args: any): Promise<string> {
     }
 
     case "trivy_scan_image": {
-      const sev = args.severity || "CRITICAL,HIGH";
-      const cmd = `trivy image --severity ${sev} --format json --quiet ${args.image}`;
+      const sev   = args.severity || "CRITICAL,HIGH";
+      const cache = `/tmp/trivy-cache-${process.pid}`;
+      const cmd   = `trivy image --severity ${sev} --format json --quiet --cache-dir ${cache} ${args.image}`;
       try { const { stdout } = await execAsync(cmd, { timeout: 120000, maxBuffer: 10 * 1024 * 1024 }); return stdout || "{}"; }
       catch (e: any) { return e.stdout || e.message; }
     }
 
     case "trivy_scan_manifest": {
-      const cmd = `trivy config --format json --quiet ${args.path}`;
+      const cache = `/tmp/trivy-cache-${process.pid}`;
+      const cmd   = `trivy config --format json --quiet --cache-dir ${cache} ${args.path}`;
       try { const { stdout } = await execAsync(cmd, { timeout: 60000 }); return stdout || "{}"; }
       catch (e: any) { return e.stdout || e.message; }
     }
