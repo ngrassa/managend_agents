@@ -34,9 +34,9 @@ jobs:
 
       - name: Build MCP servers
         run: |
-          cd mcp-kubectl && npm ci && npm run build && cd ..
-          cd mcp-trivy   && npm ci && npm run build && cd ..
-          cd mcp-slack   && npm ci && npm run build && cd ..
+          cd mcp-kubectl  && npm ci && npm run build && cd ..
+          cd mcp-trivy    && npm ci && npm run build && cd ..
+          cd mcp-telegram && npm ci && npm run build && cd ..
 
       - name: Install trivy
         run: |
@@ -69,8 +69,8 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           AGENT_ID: ${{ secrets.CLAUDE_AGENT_ID }}
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
 
       - name: Upload Security Report
