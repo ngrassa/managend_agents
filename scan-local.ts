@@ -93,7 +93,7 @@ async function callAnthropic(messages: Message[]): Promise<{ text: string; toolC
     id: b.id, name: b.name, input: b.input,
     _raw: b,
   }));
-  return { text, toolCalls, stopReason: res.stop_reason };
+  return { text, toolCalls, stopReason: res.stop_reason ?? "end_turn" };
 }
 
 // ── Exécuteurs d'outils ───────────────────────────────────────────────────
@@ -197,7 +197,7 @@ async function runDevSecOpsScan(namespace: string = "default") {
       // Ajouter réponse assistant avec tool_calls au format Mistral
       messages.push({
         role: "assistant",
-        content: text || null,
+        content: text || "",
         ...(toolCalls.length > 0 ? { tool_calls: toolCalls.map(tc => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: JSON.stringify(tc.input) } })) } : {}),
       } as any);
 
